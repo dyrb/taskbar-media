@@ -1,0 +1,15 @@
+/target/
+/dist/
+/PLAN.md
+/AGENTS.md
+/.codex/
+/.claude/
+/.agents/
+/.idea/
+/.vscode/
+/scratchpad/
+*.pdb
+*.dmp
+*.log
+TaskbarMedia.ini
+TaskbarMedia.ini.tmp

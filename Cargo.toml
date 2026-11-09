@@ -1,0 +1,29 @@
+[package]
+name = "taskbar-media"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+description = "Native Windows taskbar media controls and audio visualisation"
+repository = "https://github.com/dyrb/taskbar-media"
+readme = "README.md"
+
+[dependencies]
+
+[lib]
+name = "taskbar_media_band"
+crate-type = ["rlib", "cdylib"]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "unwind"
+debug = false
+strip = true
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"
