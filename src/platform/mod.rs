@@ -15,10 +15,14 @@ impl Activity {
         Self
     }
     pub(crate) fn callback() -> Result<Self> {
-        CALLBACKS
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < 128).then_some(n + 1))
-            .map(|_| Self)
-            .map_err(|_| Error::new("too many outstanding system callbacks", ffi::E_BOUNDS))
+        let mut count = CALLBACKS.load(Ordering::Acquire);
+        while count < 128 {
+            match CALLBACKS.compare_exchange_weak(count, count + 1, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return Ok(Self),
+                Err(actual) => count = actual,
+            }
+        }
+        Err(Error::new("too many outstanding system callbacks", ffi::E_BOUNDS))
     }
 }
 impl Drop for Activity {

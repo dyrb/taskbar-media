@@ -681,7 +681,13 @@ unsafe extern "system" fn factory_lock(_: Raw, lock: i32) -> i32 {
     if lock != 0 {
         LOCKS.fetch_add(1, Ordering::Relaxed);
     } else {
-        let _ = LOCKS.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
+        let mut count = LOCKS.load(Ordering::Acquire);
+        while count != 0 {
+            match LOCKS.compare_exchange_weak(count, count - 1, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => break,
+                Err(actual) => count = actual,
+            }
+        }
     }
     0
 }

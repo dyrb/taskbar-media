@@ -1963,7 +1963,7 @@ mod tests {
             fill(paint.dc, rect, 0x00112233);
             drop(paint);
             assert_ne!(GdiFlush(), 0);
-            for pixel in std::slice::from_raw_parts(target.bits.cast::<u8>(), 8 * 8 * 4).chunks_exact(4) {
+            for pixel in std::slice::from_raw_parts(target.bits.cast::<u8>(), 8 * 8 * 4).as_chunks::<4>().0 {
                 assert_eq!(pixel, &[0x11, 0x22, 0x33, 255]);
             }
             assert!(BufferedPaintUnInit() >= 0);

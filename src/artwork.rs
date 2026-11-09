@@ -213,7 +213,7 @@ mod tests {
         bmp[22..26].copy_from_slice(&2u32.to_le_bytes());
         bmp[26..28].copy_from_slice(&1u16.to_le_bytes());
         bmp[28..30].copy_from_slice(&32u16.to_le_bytes());
-        for p in bmp[54..].chunks_exact_mut(4) {
+        for p in bmp[54..].as_chunks_mut::<4>().0 {
             p.copy_from_slice(&[20, 40, 60, 0]);
         }
         let image = decode(&bmp, &stop).unwrap();
