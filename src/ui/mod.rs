@@ -29,6 +29,7 @@ const WM_CARD_CLOSE: u32 = 0x8000 + 57;
 const WM_CARD_PIN: u32 = 0x8000 + 58;
 const CARD_LEAVE_TIMER: usize = 7003;
 const SAVE_RESIZE_TIMER: usize = 7002;
+const BUTTON_GLYPHS: [u16; 5] = [0xe892, 0xe768, 0xe769, 0xe893, 0xe712];
 static CLASS_MODULE: OnceLock<usize> = OnceLock::new();
 
 mod layout;
@@ -238,6 +239,9 @@ struct View {
     text_engine: Option<text::Engine>,
     title_cache: text::Cached,
     artist_cache: text::Cached,
+    button_cache: [[Option<text::Raster>; 3]; 5],
+    button_key: Option<(u32, i32, [u32; 3])>,
+    symbol_font: Raw,
     gradient_buffer: Option<Buffer>,
     gradient_palette: [u32; 256],
     drag: Option<Element>,
@@ -287,6 +291,9 @@ impl Drop for View {
             }
             if !self.small_font.is_null() {
                 DeleteObject(self.small_font);
+            }
+            if !self.symbol_font.is_null() {
+                DeleteObject(self.symbol_font);
             }
             BufferedPaintUnInit();
         }
@@ -354,6 +361,9 @@ pub(crate) fn create(parent: Raw) -> Result<Raw> {
         text_engine: None,
         title_cache: text::Cached::default(),
         artist_cache: text::Cached::default(),
+        button_cache: std::array::from_fn(|_| std::array::from_fn(|_| None)),
+        button_key: None,
+        symbol_font: null_mut(),
         gradient_buffer: None,
         gradient_palette: [0; 256],
         drag: None,
@@ -589,7 +599,8 @@ fn dispatch(hwnd: Raw, message: u32, w: usize, l: isize) -> isize {
         }
         if message == WM_MOVE_BAND {
             // No View borrow crosses native shell layout and possible synchronous destruction.
-            let result = rebar::move_band(hwnd, w as u32);
+            let width = (*pointer).borrow().settings.width;
+            let result = rebar::move_band(hwnd, w as u32, width);
             let pointer = GetWindowLongPtrW(hwnd, -21) as *const RefCell<View>;
             if !pointer.is_null()
                 && let Err(error) = result
@@ -1188,7 +1199,30 @@ impl View {
             }
             _ => self.cover = None,
         }
-        let (_, foreground, muted, _) = self.colors();
+        let (_, foreground, muted, accent) = self.colors();
+        let side = self
+            .layout
+            .buttons
+            .iter()
+            .filter(|r| r.width() > 0 && r.height() > 0)
+            .map(|r| r.width().min(r.height()))
+            .min()
+            .unwrap_or(0)
+            .min(((18 * self.dpi + 48) / 96) as i32);
+        let key = (self.dpi, side, [foreground, muted, accent]);
+        if self.button_key != Some(key)
+            || self.text_engine.is_some() && side > 0 && self.button_cache.iter().flatten().any(Option::is_none)
+        {
+            self.button_cache = std::array::from_fn(|i| {
+                std::array::from_fn(|state| {
+                    self.text_engine
+                        .as_ref()
+                        .filter(|_| side > 0)
+                        .and_then(|e| e.icon(BUTTON_GLYPHS[i], side, self.dpi, key.2[state]).ok())
+                })
+            });
+            self.button_key = Some(key);
+        }
         let title = self.layout.title();
         let artist = self.layout.artist();
         self.title_cache.update(
@@ -1403,6 +1437,28 @@ impl View {
             }
             if self.text_engine.is_none() {
                 self.text_engine = text::Engine::new().ok();
+            }
+            let font = CreateFontW(
+                -(((14 * self.dpi + 48) / 96) as i32),
+                0,
+                0,
+                0,
+                400,
+                0,
+                0,
+                0,
+                1,
+                0,
+                0,
+                4,
+                0,
+                wide("Segoe MDL2 Assets").as_ptr(),
+            );
+            if !font.is_null() {
+                if !self.symbol_font.is_null() {
+                    DeleteObject(self.symbol_font);
+                }
+                self.symbol_font = font;
             }
             if self.standalone {
                 let dark = i32::from(self.dark);
@@ -1736,64 +1792,55 @@ impl View {
         };
         let alpha = buffered.as_ref().is_some_and(|p| p.transparent);
         self.background(item.hwnd, item.dc, item.rect, alpha);
-        let actual_color = color;
-        let color = if alpha { 0xffffff } else { color };
-        let cx = (item.rect.left + item.rect.right) / 2;
-        let cy = (item.rect.top + item.rect.bottom) / 2;
-        let d = ((5 * self.dpi + 48) / 96) as i32;
-        // SAFETY: owner-draw for real native buttons. Stock objects are restored, never deleted.
+        let index = match item.id {
+            101 => 0,
+            102 if self.state.snapshot.as_ref().is_some_and(|s| s.playback == Playback::Playing) => 2,
+            102 => 1,
+            103 => 3,
+            104 => 4,
+            _ => return,
+        };
+        let state = if item.state & 4 != 0 {
+            1
+        } else if active {
+            2
+        } else {
+            0
+        };
+        // SAFETY: native BUTTON retains input, focus, captions and accessibility. Only its pixels are supplied here.
         unsafe {
-            let old_pen = SelectObject(item.dc, GetStockObject(19));
-            let old_brush = SelectObject(item.dc, GetStockObject(18));
-            SetDCPenColor(item.dc, color);
-            SetDCBrushColor(item.dc, color);
-            let triangle = |a: Point, b: Point, c: Point| {
-                Polygon(item.dc, [a, b, c].as_ptr(), 3);
-            };
-            match item.id {
-                101 | 103 => {
-                    let sign = if item.id == 101 { -1 } else { 1 };
-                    triangle(
-                        Point { x: cx - sign * d, y: cy - d },
-                        Point { x: cx - sign * d, y: cy + d },
-                        Point { x: cx + sign * (d - 1), y: cy },
-                    );
-                    fill(
-                        item.dc,
-                        Rect { left: cx + sign * d, top: cy - d, right: cx + sign * d + 2, bottom: cy + d + 1 },
-                        color,
-                    );
-                }
-                102 if self.state.snapshot.as_ref().is_some_and(|s| s.playback == Playback::Playing) => {
-                    for x in [cx - d, cx + 1] {
-                        fill(item.dc, Rect { left: x, top: cy - d, right: x + d - 1, bottom: cy + d }, color);
-                    }
-                }
-                102 => triangle(
-                    Point { x: cx - d + 1, y: cy - d },
-                    Point { x: cx - d + 1, y: cy + d },
-                    Point { x: cx + d, y: cy },
-                ),
-                104 => {
-                    for x in [cx - d, cx, cx + d] {
-                        fill(item.dc, Rect { left: x - 1, top: cy - 1, right: x + 1, bottom: cy + 1 }, color);
-                    }
-                }
-                _ => {}
-            }
-            SelectObject(item.dc, old_pen);
-            SelectObject(item.dc, old_brush);
             if item.state & 16 != 0 {
-                let mut r = item.rect;
-                r.left += 2;
-                r.right -= 2;
-                r.top += 2;
-                r.bottom -= 2;
+                let r = Rect {
+                    left: item.rect.left + 2,
+                    top: item.rect.top + 2,
+                    right: item.rect.right - 2,
+                    bottom: item.rect.bottom - 2,
+                };
                 DrawFocusRect(item.dc, &r);
+                if self.button_cache[index][state].is_some()
+                    && let Some(paint) = &buffered
+                {
+                    paint.colorize(item.rect, color);
+                }
             }
-        }
-        if let Some(paint) = &buffered {
-            paint.colorize(item.rect, actual_color);
+            if let Some(raster) = &self.button_cache[index][state] {
+                let left = item.rect.left + (item.rect.width() - raster.buffer.width) / 2;
+                let top = item.rect.top + (item.rect.height() - raster.buffer.height) / 2;
+                raster.draw(
+                    item.dc,
+                    Rect { left, top, right: left + raster.buffer.width, bottom: top + raster.buffer.height },
+                );
+            } else {
+                let old = SelectObject(item.dc, self.symbol_font);
+                SetBkMode(item.dc, 1);
+                SetTextColor(item.dc, if alpha { 0xffffff } else { color });
+                let mut rect = item.rect;
+                DrawTextW(item.dc, [BUTTON_GLYPHS[index]].as_ptr(), 1, &mut rect, 0x20 | 0x4 | 0x1 | 0x800);
+                SelectObject(item.dc, old);
+                if let Some(paint) = &buffered {
+                    paint.colorize(item.rect, color);
+                }
+            }
         }
     }
     fn draw_visual(&self, dc: Raw, area: Rect, color: u32) {
@@ -1998,6 +2045,9 @@ pub(crate) fn band_preferences(hwnd: Raw) -> Option<(u32, bool)> {
             (*pointer).try_borrow().ok().map(|v| (v.settings.width, v.settings.full_height))
         }
     }
+}
+pub(crate) fn band_row_extent(hwnd: Raw, vertical: bool) -> Option<i32> {
+    rebar::row_extent(hwnd, vertical)
 }
 pub(crate) fn set_band_shown(hwnd: Raw, shown: bool) {
     // SAFETY: the shell's ShowDW controls this owned view; delivery never waits for COM/driver shutdown.

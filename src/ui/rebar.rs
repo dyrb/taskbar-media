@@ -40,6 +40,45 @@ const IDEAL: u32 = 0x200;
 const HEADER: u32 = 0x800;
 const CHILD_SIZE: u32 = 0x20;
 
+fn available_cross(hwnd: Raw, parent: Raw, index: usize, vertical: bool) -> i32 {
+    // SAFETY: caller validated the rebar's owning thread; these are synchronous geometry queries.
+    unsafe {
+        let mut container = Rect::default();
+        let mut root = Rect::default();
+        GetClientRect(parent, &mut container);
+        GetClientRect(GetAncestor(hwnd, 2), &mut root);
+        let extent = if vertical { container.width().min(root.width()) } else { container.height().min(root.height()) };
+        let row = SendMessageW(parent, 0x400 + 14, index, 0) as i32;
+        if SendMessageW(parent, 0x400 + 13, 0, 0) > 1 && row > 0 { extent.min(row).max(1) } else { extent.max(1) }
+    }
+}
+
+pub(super) fn row_extent(hwnd: Raw, vertical: bool) -> Option<i32> {
+    let parent = parent(hwnd)?;
+    // SAFETY: never send pointer messages across a process or thread boundary.
+    unsafe {
+        let mut process = 0;
+        if GetWindowThreadProcessId(parent, &mut process) != GetCurrentThreadId() || process != GetCurrentProcessId() {
+            return None;
+        }
+        let count = SendMessageW(parent, GET_COUNT, 0, 0);
+        if !(1..=1024).contains(&count) {
+            return None;
+        }
+        for index in 0..count as usize {
+            let mut info =
+                BandInfo { size: std::mem::offset_of!(BandInfo, chevron) as u32, mask: CHILD, ..BandInfo::default() };
+            if SendMessageW(parent, GET_INFO, index, (&mut info as *mut BandInfo) as isize) == 0 {
+                return None;
+            }
+            if info.child == hwnd {
+                return Some(available_cross(hwnd, parent, index, vertical));
+            }
+        }
+    }
+    None
+}
+
 pub(super) fn parent(hwnd: Raw) -> Option<Raw> {
     // SAFETY: bounded parent traversal, no subclasses or changes to other bands.
     unsafe {
@@ -65,7 +104,7 @@ pub(super) fn dragging(hwnd: Raw) -> bool {
 }
 
 /// Move only our band through the rebar's documented ordering message, never screen coordinates.
-pub(super) fn move_band(hwnd: Raw, direction: u32) -> Result<()> {
+pub(super) fn move_band(hwnd: Raw, direction: u32, logical_width: u32) -> Result<()> {
     let parent = parent(hwnd).ok_or(Error::new("taskbar rebar is unavailable", 0x80004002u32 as i32))?;
     // SAFETY: validate the same process and thread before passing stack buffers to the container.
     unsafe {
@@ -101,8 +140,43 @@ pub(super) fn move_band(hwnd: Raw, direction: u32) -> Result<()> {
             if target == index {
                 return Ok(());
             }
+            // A row break belongs to the old position. Carrying it to the new index creates an
+            // extra row even when the destination has room for this band.
+            if info.style & 1 != 0 {
+                info.mask = 1;
+                info.style &= !1;
+                if SendMessageW(parent, SET_INFO, index, (&mut info as *mut BandInfo) as isize) == 0 {
+                    return Err(Error::new("clear taskbar band row break", 0x80004005u32 as i32));
+                }
+            }
             if SendMessageW(parent, 0x400 + 39, index, target as isize) == 0 {
                 return Err(Error::new("move taskbar band", 0x80004005u32 as i32));
+            }
+            // The last band can occupy all spare space. Do not carry that stretched width to
+            // the beginning of the row, where it would push the application band to another row.
+            set_size(hwnd, Some(logical_width))?;
+            #[repr(C)]
+            struct Header {
+                hwnd: Raw,
+                id: usize,
+                code: u32,
+            }
+            let owner = GetParent(parent);
+            if !owner.is_null()
+                && GetWindowThreadProcessId(owner, &mut process) == GetCurrentThreadId()
+                && process == GetCurrentProcessId()
+            {
+                let header =
+                    Header { hwnd: parent, id: GetWindowLongPtrW(parent, -12) as usize, code: (-833i32) as u32 };
+                // Programmatic reordering must also tell the shell to reconcile/save its layout.
+                SendMessageW(owner, 0x004e, header.id, (&header as *const Header) as isize);
+            }
+            let mut actual =
+                BandInfo { size: std::mem::offset_of!(BandInfo, chevron) as u32, mask: CHILD, ..BandInfo::default() };
+            if SendMessageW(parent, GET_INFO, target, (&mut actual as *mut BandInfo) as isize) == 0
+                || actual.child != hwnd
+            {
+                return Err(Error::new("taskbar host rejected band position", 0x80004005u32 as i32));
             }
             return Ok(());
         }
@@ -144,12 +218,7 @@ pub(super) fn set_size(hwnd: Raw, logical_width: Option<u32>) -> Result<()> {
             } else {
                 info.header as i32
             };
-            let mut container = Rect::default();
-            let mut root = Rect::default();
-            GetClientRect(parent, &mut container);
-            GetClientRect(GetAncestor(hwnd, 2), &mut root);
-            let cross =
-                if vertical { container.width().min(root.width()) } else { container.height().min(root.height()) };
+            let cross = available_cross(hwnd, parent, index, vertical);
             let border = if measured {
                 if vertical { (band.width() - client.width()).max(0) } else { (band.height() - client.height()).max(0) }
             } else {
@@ -157,7 +226,7 @@ pub(super) fn set_size(hwnd: Raw, logical_width: Option<u32>) -> Result<()> {
             };
             info.mask = CHILD_SIZE;
             info.height = (cross - border).max(1) as u32;
-            info.min_height = info.height;
+            info.min_height = info.height.min((32 * GetDpiForWindow(hwnd).max(96) + 48) / 96);
             info.max_height = info.height;
             info.integral = 1;
             if let Some(logical_width) = logical_width {
@@ -229,7 +298,7 @@ mod tests {
                 null_mut(),
             );
             assert!(!bar.is_null());
-            let mut children = [null_mut(); 2];
+            let mut children = [null_mut(); 3];
             for (i, child) in children.iter_mut().enumerate() {
                 *child = CreateWindowExW(
                     0,
@@ -287,14 +356,46 @@ mod tests {
                 }
             }
             assert_eq!(size_of::<BandInfo>(), 128);
-            move_band(children[0], 3).unwrap();
+            let mut wrap = BandInfo {
+                size: std::mem::offset_of!(BandInfo, chevron) as u32,
+                mask: 1,
+                style: 0x80 | 0x40 | 1,
+                ..BandInfo::default()
+            };
+            assert_ne!(SendMessageW(bar, SET_INFO, 1, (&mut wrap as *mut BandInfo) as isize), 0);
+            SetWindowPos(owner, null_mut(), 0, 0, 1200, 240, 0x14);
+            SetWindowPos(bar, null_mut(), 0, 0, 1200, 240, 0x14);
+            assert!(SendMessageW(bar, 0x400 + 13, 0, 0) > 1);
+            let row_height = SendMessageW(bar, 0x400 + 14, 0, 0) as i32;
+            for _ in 0..4 {
+                set_size(children[0], None).unwrap();
+                let mut actual = Rect::default();
+                GetClientRect(children[0], &mut actual);
+                assert!(actual.height() <= row_height, "another row must not increase this band's required height");
+            }
+            move_band(children[0], 3, 360).unwrap();
             let mut moved =
                 BandInfo { size: std::mem::offset_of!(BandInfo, chevron) as u32, mask: CHILD, ..BandInfo::default() };
+            assert_ne!(SendMessageW(bar, GET_INFO, 2, (&mut moved as *mut BandInfo) as isize), 0);
+            assert_eq!(moved.child, children[0]);
+            move_band(children[0], 1, 360).unwrap();
             assert_ne!(SendMessageW(bar, GET_INFO, 1, (&mut moved as *mut BandInfo) as isize), 0);
             assert_eq!(moved.child, children[0]);
-            move_band(children[0], 0).unwrap();
+            move_band(children[0], 2, 360).unwrap();
+            assert_ne!(SendMessageW(bar, GET_INFO, 2, (&mut moved as *mut BandInfo) as isize), 0);
+            assert_eq!(moved.child, children[0]);
+            move_band(children[0], 0, 360).unwrap();
             assert_ne!(SendMessageW(bar, GET_INFO, 0, (&mut moved as *mut BandInfo) as isize), 0);
             assert_eq!(moved.child, children[0]);
+            wrap.style = 0x80 | 0x40 | 1;
+            assert_ne!(SendMessageW(bar, SET_INFO, 0, (&mut wrap as *mut BandInfo) as isize), 0);
+            move_band(children[0], 3, 360).unwrap();
+            moved.mask = CHILD | 1;
+            assert_ne!(SendMessageW(bar, GET_INFO, 2, (&mut moved as *mut BandInfo) as isize), 0);
+            assert_eq!(moved.style & 1, 0, "an explicit move must not carry the old row break");
+            wrap.style |= 0x100;
+            assert_ne!(SendMessageW(bar, SET_INFO, 2, (&mut wrap as *mut BandInfo) as isize), 0);
+            assert_eq!(move_band(children[0], 0, 360).unwrap_err().code, 0x80070005u32 as i32);
             DestroyWindow(owner);
         }
     }

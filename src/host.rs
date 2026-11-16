@@ -371,10 +371,6 @@ unsafe extern "system" fn info(this: Raw, id: u32, mode: u32, out: *mut BandInfo
             let scale = |v: i32| ((v as i64 * dpi as i64 + 48) / 96) as i32;
             let (width, _) = ui::band_preferences(state.hwnd).unwrap_or((360, false));
             let width = width as i32;
-            let mut parent = Rect::default();
-            if !state.hwnd.is_null() {
-                GetClientRect(GetParent(state.hwnd), &mut parent);
-            }
             let b = &mut *out;
             let vertical = mode & 1 != 0;
             if b.mask & 1 != 0 {
@@ -388,13 +384,13 @@ unsafe extern "system" fn info(this: Raw, id: u32, mode: u32, out: *mut BandInfo
             }
             if b.mask & 8 != 0 {
                 b.actual = Point {
-                    x: if vertical && parent.width() > 0 {
-                        parent.width().max(scale(32))
+                    x: if vertical {
+                        ui::band_row_extent(state.hwnd, true).unwrap_or(scale(64)).max(scale(32))
                     } else {
                         scale(if vertical { 64 } else { width })
                     },
-                    y: if !vertical && parent.height() > 0 {
-                        parent.height().max(scale(32))
+                    y: if !vertical {
+                        ui::band_row_extent(state.hwnd, false).unwrap_or(scale(40)).max(scale(32))
                     } else {
                         scale(if vertical { 180 } else { 40 })
                     },

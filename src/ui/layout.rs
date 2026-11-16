@@ -73,6 +73,7 @@ impl Layout {
         let gap = px(6);
         let row = h.min(px(40));
         let side = px(30).min(row).min(w);
+        let button_width = px(24).min(side);
         let enabled = |i| if i == 3 { s.menu_button } else { s.controls };
         if w < px(120) && h > px(80) {
             // A vertical taskbar stacks the same ordered groups instead of clipping a horizontal row.
@@ -96,13 +97,21 @@ impl Layout {
                     Element::Text => r.text = Rect { left: gap.min(w), right: (w - gap).max(gap.min(w)), ..area },
                     Element::Visual => r.visual = area,
                     Element::Controls => {
-                        let mut x = 0;
+                        let mut selected = [false; 4];
+                        let mut count = 0;
                         for i in [1, 3, 0, 2].into_iter().filter(|&i| enabled(i)) {
-                            if x + side > w {
+                            if (count + 1) * button_width > w {
                                 break;
                             }
-                            r.buttons[i] = Rect { left: x, right: x + side, ..area };
-                            x += side;
+                            selected[i] = true;
+                            count += 1;
+                        }
+                        let mut x = (w - count * button_width) / 2;
+                        for (i, show) in selected.into_iter().enumerate() {
+                            if show {
+                                r.buttons[i] = Rect { left: x, right: x + button_width, ..area };
+                                x += button_width;
+                            }
                         }
                     }
                 }
@@ -114,13 +123,13 @@ impl Layout {
             let mut selected = [false; 4];
             let mut count = 0;
             for i in [1, 3, 0, 2].into_iter().filter(|&i| enabled(i)) {
-                if (count + 1) * side + gap + px(64) > budget {
+                if (count + 1) * button_width + gap + px(64) > budget {
                     break;
                 }
                 selected[i] = true;
                 count += 1;
             }
-            let controls = count * side;
+            let controls = count * button_width;
             budget -= controls + if controls > 0 { gap } else { 0 };
             let vw = if s.visual != Visual::Off && budget >= px(150) { (budget / 3).clamp(px(48), px(144)) } else { 0 };
             let text_w = (budget - vw - if vw > 0 { gap } else { 0 }).max(0);
@@ -147,10 +156,10 @@ impl Layout {
                                 r.buttons[i] = Rect {
                                     left: bx,
                                     top: (row - side) / 2,
-                                    right: bx + side,
+                                    right: bx + button_width,
                                     bottom: (row + side) / 2,
                                 };
-                                bx += side;
+                                bx += button_width;
                             }
                         }
                     }
@@ -224,6 +233,17 @@ pub(super) fn reorder(order: &mut [Element; 4], element: Element, target: usize)
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn transport_buttons_form_a_compact_ordered_group_in_both_orientations() {
+        let settings = Settings { controls: true, menu_button: true, ..Settings::default() };
+        for (w, h) in [(480, 40), (96, 600)] {
+            let layout = Layout::new(w, h, 96, &settings);
+            assert!(layout.buttons.iter().all(|r| r.width() == 24));
+            for pair in layout.buttons.windows(2) {
+                assert_eq!(pair[0].right, pair[1].left);
+            }
+        }
+    }
     #[test]
     fn every_element_permutation_stays_disjoint_after_fitting_text() {
         for a in Element::ALL {

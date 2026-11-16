@@ -25,7 +25,7 @@ struct FactoryVtbl {
 #[repr(C)]
 struct FormatVtbl {
     unknown: UnknownVtbl,
-    _alignment: usize,
+    alignment: unsafe extern "system" fn(Raw, u32) -> i32,
     paragraph: unsafe extern "system" fn(Raw, u32) -> i32,
     wrapping: unsafe extern "system" fn(Raw, u32) -> i32,
     _reading_flow_tab: [usize; 3],
@@ -262,12 +262,21 @@ impl Engine {
         }
     }
     pub fn raster(&self, text: &[u16], area: Rect, style: Style) -> Result<Raster> {
-        self.render(text, area, style, false)
+        self.render(text, area, style, false, false)
     }
     pub fn raster_fit(&self, text: &[u16], area: Rect, style: Style) -> Result<Raster> {
-        self.render(text, area, style, true)
+        self.render(text, area, style, true, false)
     }
-    fn render(&self, text: &[u16], mut area: Rect, style: Style, fit: bool) -> Result<Raster> {
+    pub fn icon(&self, glyph: u16, side: i32, dpi: u32, color: u32) -> Result<Raster> {
+        self.render(
+            &[glyph],
+            Rect { left: 0, top: 0, right: side, bottom: side },
+            Style { dpi, size: 14., weight: 400, color, wrap: false },
+            false,
+            true,
+        )
+    }
+    fn render(&self, text: &[u16], mut area: Rect, style: Style, fit: bool, icon: bool) -> Result<Raster> {
         let Style { dpi, size: font_size, weight, color, wrap } = style;
         if area.width() == 0 || area.height() == 0 || text.is_empty() {
             return Err(Error::new("empty text destination", E_BOUNDS));
@@ -280,7 +289,7 @@ impl Engine {
             check(
                 (factory.format)(
                     self.factory.raw(),
-                    wide("Segoe UI").as_ptr(),
+                    wide(if icon { "Segoe MDL2 Assets" } else { "Segoe UI" }).as_ptr(),
                     null_mut(),
                     weight,
                     0,
@@ -293,6 +302,7 @@ impl Engine {
             )?;
             let format = Com::owned(raw, "text format")?;
             let fv = format.vt::<FormatVtbl>();
+            check((fv.alignment)(format.raw(), u32::from(icon) * 2), "align glyphs")?;
             check((fv.paragraph)(format.raw(), if wrap { 0 } else { 2 }), "align text")?;
             check((fv.wrapping)(format.raw(), u32::from(!wrap)), "wrap text")?;
             check((factory.ellipsis)(self.factory.raw(), format.raw(), &mut raw), "create text ellipsis")?;
@@ -423,5 +433,14 @@ mod tests {
         let long = engine.raster_fit(&wide("A longer song title that needs more than one line"), area, style).unwrap();
         assert!(short.buffer.height < 24);
         assert!(long.buffer.height > short.buffer.height && long.buffer.height <= 40);
+        for glyph in super::super::BUTTON_GLYPHS {
+            let icon = engine.icon(glyph, 18, 96, 0xffffff).unwrap();
+            // SAFETY: owned offscreen DIB after native rasterisation has completed.
+            let pixels = unsafe { std::slice::from_raw_parts(icon.buffer.bits.cast::<u32>(), 18 * 18) };
+            assert!(pixels.iter().any(|p| p >> 24 > 0), "system icon must contain visible pixels");
+            if glyph == 0xe768 {
+                assert!(pixels.iter().any(|p| (1..255).contains(&(p >> 24))), "play edges must be antialiased");
+            }
+        }
     }
 }

@@ -15,6 +15,7 @@ in your usual player. Written in Rust with a native Windows interface.
 ## Features
 
 - Track information and previous, play/pause and next buttons from Windows media sessions.
+- Compact native buttons with cached, antialiased system media icons.
 - Capture the current player's process tree, or explicitly select all output audio.
 - Waveform and 32-band spectrum, solid or separated drawing, 15 or 30 FPS.
 - Amplitude and release-time settings, native colour picker with 16 saved custom colours.

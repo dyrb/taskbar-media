@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.2
+
+- Native Segoe MDL2 playback icons rasterised with DirectWrite and cached for button states.
+- Tighter transport-button spacing, including consistent order on a vertical taskbar.
+- Row-aware band height to prevent growth when toolbars wrap onto multiple rows.
+- Restore the configured width and clear a carried row break when moving the band; notify the host and verify its resulting order.
+
 ## 0.1.1
 
 - Larger cached DirectWrite text with single-line and two-line layouts.
