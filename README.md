@@ -19,6 +19,10 @@ in your usual player. Written in Rust with a native Windows interface.
 - Waveform and 32-band spectrum, solid or separated drawing, 15 or 30 FPS.
 - Amplitude and release-time settings, native colour picker with 16 saved custom colours.
 - Adjustable width, compact or full taskbar height, optional artwork and transparent background.
+- Larger cached DirectWrite text, with a title-only or title-and-artist layout.
+- Artwork resampled to its physical pixel size through WIC, rather than stretched during painting.
+- Reorder artwork, text, visualisation and controls through the menu or Alt+drag.
+- Optional two-colour visualisation gradient and an on-demand track card.
 - Hide playback and settings buttons independently; right-click settings remain available.
 - System, light and dark themes, high contrast, DPI scaling, English and Russian.
 - Event-driven media updates and audio capture. Capture and FFT stop when playback is paused,
@@ -66,6 +70,24 @@ For a separate window, run:
 .\taskbar-media-ui.exe --window
 ```
 
+**Text** selects a large title or two lines. **Element order** sets the positions of artwork,
+text, visualisation and the control group. Alt+drag an element onto another to move it;
+the same order applies when the taskbar is vertical. Disabled elements retain their position.
+**Visualisation > Gradient** uses the main colour and **Second colour...** across the width.
+The colours are static; the existing audio analysis and frame-rate limit are unchanged.
+
+Hover over the widget to open a track card, or click its text/artwork to activate it.
+The compact card shows artwork, title, artist and album, with height fitted to the text.
+Move away to close a hover card;
+an activated card closes on Escape or losing focus. **Card on hover** disables automatic
+opening; clicking and **Open card** remain available. The card creates no audio stream.
+If widget artwork is off, its image is requested only while the card is open.
+
+On Windows 10, unlock the taskbar to move its native sizing grip. **Taskbar position**
+also moves this band first, last or one position among the container's bands, using
+`RB_MOVEBAND`. Windows controls the available locations. This does not insert the widget
+between individual pinned application buttons or reposition other taskbar windows manually.
+
 ### Files and registration
 
 | File | Purpose |
@@ -92,6 +114,14 @@ when enabling it:
 ```powershell
 .\taskbar-media.exe disable
 .\taskbar-media.exe unregister
+```
+
+To apply an update that Explorer still holds, `restart-taskbar.ps1` restarts Explorer in
+your current Windows session and enables the band from the same folder. It may close folder
+windows. Run it yourself when ready; it is never started automatically. From a source checkout:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\restart-taskbar.ps1
 ```
 
 ### Command line
@@ -163,6 +193,11 @@ Artwork is decoded by Windows Imaging Component, with limits of 8 MiB encoded in
 an operation already in progress finishes cooperatively. The media engine remains available
 for track updates and controls. The DeskBand runs inside Explorer, so its resource use is
 part of that process.
+
+Process-audio activation waits for an earlier cancelled request to finish, with a shared
+10-second deadline and immediate cancellation. Known transient capture failures get at most
+three recovery attempts (250, 750 and 2000 ms); successful audio packets reset that budget.
+There is no periodic retry while healthy or after the recovery budget is exhausted.
 
 ## License
 

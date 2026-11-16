@@ -45,6 +45,9 @@ struct FactoryVtbl {
     _file_handle_component_decoder_encoder_palette: [usize; 5],
     converter: unsafe extern "system" fn(Raw, *mut Raw) -> i32,
     scaler: unsafe extern "system" fn(Raw, *mut Raw) -> i32,
+    clipper: unsafe extern "system" fn(Raw, *mut Raw) -> i32,
+    _flip_stream_color_transform_bitmap_source_rect: [usize; 7],
+    memory: unsafe extern "system" fn(Raw, u32, u32, *const Guid, u32, u32, *const u8, *mut Raw) -> i32,
 }
 #[repr(C)]
 struct DecoderVtbl {
@@ -63,6 +66,72 @@ struct SourceVtbl {
 struct ScalerVtbl {
     source: SourceVtbl,
     initialize: unsafe extern "system" fn(Raw, Raw, u32, u32, u32) -> i32,
+}
+#[repr(C)]
+struct ClipperVtbl {
+    source: SourceVtbl,
+    initialize: unsafe extern "system" fn(Raw, Raw, *const [i32; 4]) -> i32,
+}
+
+/// Resample once for a destination in physical pixels; never scale in the paint loop.
+pub(crate) fn resize(image: &Image, crop: [i32; 4], width: u32, height: u32) -> Result<Image> {
+    let [x, y, w, h] = crop;
+    if width == 0
+        || height == 0
+        || width as u64 * height as u64 > 2_097_152
+        || x < 0
+        || y < 0
+        || w <= 0
+        || h <= 0
+        || x as i64 + w as i64 > image.width as i64
+        || y as i64 + h as i64 > image.height as i64
+        || image.pixels.len() as u64 != image.width as u64 * image.height as u64 * 4
+    {
+        return Err(Error::new("invalid artwork destination", E_BOUNDS));
+    }
+    // SAFETY: checked BGRA bounds; WIC interfaces and their source data stay alive through CopyPixels.
+    unsafe {
+        let mut raw = null_mut();
+        check(CoCreateInstance(&WIC_CLASS, null_mut(), 1, &WIC_FACTORY, &mut raw), "create artwork scaler")?;
+        let factory = Com::owned(raw, "WIC factory")?;
+        let vt = factory.vt::<FactoryVtbl>();
+        check(
+            (vt.memory)(
+                factory.raw(),
+                image.width,
+                image.height,
+                &PBGRA,
+                image.width * 4,
+                image.pixels.len() as u32,
+                image.pixels.as_ptr(),
+                &mut raw,
+            ),
+            "open decoded artwork",
+        )?;
+        let bitmap = Com::owned(raw, "WIC bitmap")?;
+        check((vt.clipper)(factory.raw(), &mut raw), "create artwork crop")?;
+        let clipper = Com::owned(raw, "WIC clipper")?;
+        check((clipper.vt::<ClipperVtbl>().initialize)(clipper.raw(), bitmap.raw(), &crop), "crop artwork")?;
+        check((vt.scaler)(factory.raw(), &mut raw), "create artwork resampler")?;
+        let scaler = Com::owned(raw, "WIC scaler")?;
+        let mode = if width > w as u32 || height > h as u32 { 2 } else { 3 };
+        check(
+            (scaler.vt::<ScalerVtbl>().initialize)(scaler.raw(), clipper.raw(), width, height, mode),
+            "resample artwork",
+        )?;
+        let mut pixels = vec![0u8; width as usize * height as usize * 4];
+        check(
+            (scaler.vt::<SourceVtbl>().copy)(
+                scaler.raw(),
+                null_mut(),
+                width * 4,
+                pixels.len() as u32,
+                pixels.as_mut_ptr(),
+            ),
+            "copy resampled artwork",
+        )?;
+        Ok(Image { width, height, pixels })
+    }
 }
 #[repr(C)]
 struct ConverterVtbl {
@@ -183,6 +252,23 @@ unsafe extern "system" {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn resampling_averages_pixels_and_preserves_alpha() {
+        let _apartment = crate::platform::com::Apartment::mta().unwrap();
+        assert_eq!(std::mem::offset_of!(FactoryVtbl, memory), 20 * size_of::<usize>());
+        let mut pixels = Vec::with_capacity(8 * 8 * 4);
+        for y in 0..8 {
+            for x in 0..8 {
+                let c = if (x + y) % 2 == 0 { 0 } else { 255 };
+                pixels.extend_from_slice(&[c, c, c, 255]);
+            }
+        }
+        let image = Image { width: 8, height: 8, pixels };
+        let small = resize(&image, [0, 0, 8, 8], 1, 1).unwrap();
+        assert!((120..=136).contains(&small.pixels[0]));
+        assert_eq!(small.pixels[3], 255);
+        assert!(resize(&image, [0, 0, 9, 8], 1, 1).is_err());
+    }
     #[test]
     fn image_bounds_preserve_ratio_and_reject_bombs() {
         assert_eq!(dimensions(4000, 2000).unwrap(), (512, 256));

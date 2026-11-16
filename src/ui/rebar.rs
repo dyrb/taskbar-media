@@ -64,6 +64,52 @@ pub(super) fn dragging(hwnd: Raw) -> bool {
     parent(hwnd).is_some_and(|p| unsafe { GetCapture() == p && GetWindowLongPtrW(p, -16) & 0x80 == 0 })
 }
 
+/// Move only our band through the rebar's documented ordering message, never screen coordinates.
+pub(super) fn move_band(hwnd: Raw, direction: u32) -> Result<()> {
+    let parent = parent(hwnd).ok_or(Error::new("taskbar rebar is unavailable", 0x80004002u32 as i32))?;
+    // SAFETY: validate the same process and thread before passing stack buffers to the container.
+    unsafe {
+        let mut process = 0;
+        if GetWindowThreadProcessId(parent, &mut process) != GetCurrentThreadId() || process != GetCurrentProcessId() {
+            return Err(Error::new("taskbar container thread mismatch", 0x80004005u32 as i32));
+        }
+        let count = SendMessageW(parent, GET_COUNT, 0, 0);
+        if !(1..=1024).contains(&count) {
+            return Err(Error::new("invalid taskbar band count", 0x80004005u32 as i32));
+        }
+        for index in 0..count as usize {
+            let mut info = BandInfo {
+                size: std::mem::offset_of!(BandInfo, chevron) as u32,
+                mask: CHILD | 1,
+                ..BandInfo::default()
+            };
+            if SendMessageW(parent, GET_INFO, index, (&mut info as *mut BandInfo) as isize) == 0 {
+                return Err(Error::new("read taskbar band", 0x80004005u32 as i32));
+            }
+            if info.child != hwnd {
+                continue;
+            }
+            if info.style & 0x100 != 0 || GetWindowLongPtrW(parent, -16) & 0x800 != 0 {
+                return Err(Error::new("taskbar bands are locked", 0x80070005u32 as i32));
+            }
+            let target = match direction {
+                0 => 0,
+                1 => index.saturating_sub(1),
+                2 => (index + 1).min(count as usize - 1),
+                _ => count as usize - 1,
+            };
+            if target == index {
+                return Ok(());
+            }
+            if SendMessageW(parent, 0x400 + 39, index, target as isize) == 0 {
+                return Err(Error::new("move taskbar band", 0x80004005u32 as i32));
+            }
+            return Ok(());
+        }
+    }
+    Err(Error::new("view is not attached to a taskbar band", 0x80004005u32 as i32))
+}
+
 pub(super) fn set_size(hwnd: Raw, logical_width: Option<u32>) -> Result<()> {
     let parent = parent(hwnd).ok_or(Error::new("taskbar rebar is unavailable", 0x80004002u32 as i32))?;
     // SAFETY: stack pointers are passed only to our same-process, same-thread rebar.
@@ -241,6 +287,14 @@ mod tests {
                 }
             }
             assert_eq!(size_of::<BandInfo>(), 128);
+            move_band(children[0], 3).unwrap();
+            let mut moved =
+                BandInfo { size: std::mem::offset_of!(BandInfo, chevron) as u32, mask: CHILD, ..BandInfo::default() };
+            assert_ne!(SendMessageW(bar, GET_INFO, 1, (&mut moved as *mut BandInfo) as isize), 0);
+            assert_eq!(moved.child, children[0]);
+            move_band(children[0], 0).unwrap();
+            assert_ne!(SendMessageW(bar, GET_INFO, 0, (&mut moved as *mut BandInfo) as isize), 0);
+            assert_eq!(moved.child, children[0]);
             DestroyWindow(owner);
         }
     }

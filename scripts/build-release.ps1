@@ -32,6 +32,7 @@ try {
     New-Item -ItemType Directory -Path $destination -Force | Out-Null
     $files = @($outputs | ForEach-Object { Join-Path $mediaRoot "target\release\$_" })
     $files += @('README.md','README.ru.md','CHANGELOG.md','LICENSE-MIT','LICENSE-APACHE') | ForEach-Object { Join-Path $mediaRoot $_ }
+    $files += Join-Path $mediaRoot 'scripts\restart-taskbar.ps1'
     $archivePath = Join-Path $destination $archive
     Compress-Archive -LiteralPath $files -DestinationPath $archivePath -Force
     $checksum = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()

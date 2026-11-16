@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.1
+
+- Larger cached DirectWrite text with single-line and two-line layouts.
+- Destination-sized WIC artwork resampling and square artwork geometry.
+- Persistent element order, Alt+drag and native rebar position commands.
+- Optional two-colour waveform/spectrum gradient with native colour selection.
+- Event-driven hover/click track card with on-demand artwork and no extra audio capture.
+- Compact 208-DIP card with measured text height and consistent artwork/text spacing.
+- Cancel-safe handoff between process-audio activations; bounded recovery from transient audio failures.
+- Manual Explorer restart script for applying a rebuilt DeskBand.
+
 ## 0.1.0
 
 - Windows 10 taskbar widget and standalone media window.

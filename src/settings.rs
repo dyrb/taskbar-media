@@ -25,6 +25,21 @@ pub enum Visual {
     Spectrum,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Element {
+    Artwork,
+    Text,
+    Visual,
+    Controls,
+}
+impl Element {
+    pub const ALL: [Self; 4] = [Self::Artwork, Self::Text, Self::Visual, Self::Controls];
+    pub fn key(self) -> &'static str {
+        ["artwork", "text", "visual", "controls"][self as usize]
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Settings {
     pub theme: Theme,
@@ -43,6 +58,11 @@ pub struct Settings {
     pub menu_button: bool,
     pub solid: bool,
     pub player_audio: bool,
+    pub order: [Element; 4],
+    pub two_lines: bool,
+    pub gradient: bool,
+    pub gradient_end: u32,
+    pub card: bool,
 }
 
 impl Default for Settings {
@@ -64,6 +84,11 @@ impl Default for Settings {
             menu_button: true,
             solid: true,
             player_audio: true,
+            order: Element::ALL,
+            two_lines: true,
+            gradient: false,
+            gradient_end: 0xe69bdb,
+            card: true,
         }
     }
 }
@@ -145,6 +170,37 @@ impl Settings {
                 "menu_button" if matches!(v, "0" | "1") => s.menu_button = v == "1",
                 "solid" if matches!(v, "0" | "1") => s.solid = v == "1",
                 "player_audio" if matches!(v, "0" | "1") => s.player_audio = v == "1",
+                "two_lines" if matches!(v, "0" | "1") => s.two_lines = v == "1",
+                "gradient" if matches!(v, "0" | "1") => s.gradient = v == "1",
+                "card" if matches!(v, "0" | "1") => s.card = v == "1",
+                "gradient_end" => {
+                    if let Ok(color @ 0..=0xffffff) = u32::from_str_radix(v, 16) {
+                        s.gradient_end = color;
+                    }
+                }
+                "order" => {
+                    let mut order = Element::ALL;
+                    let mut values = v.split(',');
+                    let mut seen = 0u8;
+                    let valid = order.iter_mut().all(|item| {
+                        let Some(value) = values.next() else {
+                            return false;
+                        };
+                        let Some(element) = Element::ALL.into_iter().find(|e| e.key() == value.trim()) else {
+                            return false;
+                        };
+                        let bit = 1 << element as u8;
+                        if seen & bit != 0 {
+                            return false;
+                        }
+                        seen |= bit;
+                        *item = element;
+                        true
+                    });
+                    if valid && values.next().is_none() {
+                        s.order = order;
+                    }
+                }
                 _ => {}
             }
         }
@@ -179,6 +235,7 @@ impl Settings {
             }
             write!(&mut colors, "{color:06x}").expect("write color into string");
         }
+        let order = self.order.map(Element::key).join(",");
         let text = format!(
             "theme={}\nlanguage={}\nvisual={}\nfps={}\ngain={}\nrelease_ms={}\nwidth={}\naccent={:06x}\nartwork={}\nfull_height={}\ntransparent={}\ncontrols={}\nmenu_button={}\nsolid={}\nplayer_audio={}\ncustom_colors={}\n",
             match self.theme {
@@ -209,6 +266,13 @@ impl Settings {
             u8::from(self.solid),
             u8::from(self.player_audio),
             colors
+        );
+        let text = format!(
+            "{text}order={order}\ntwo_lines={}\ngradient={}\ngradient_end={:06x}\ncard={}\n",
+            u8::from(self.two_lines),
+            u8::from(self.gradient),
+            self.gradient_end,
+            u8::from(self.card)
         );
         if std::fs::read(path).ok().as_deref() == Some(text.as_bytes()) {
             return Ok(());
@@ -294,6 +358,11 @@ mod tests {
         s.menu_button = false;
         s.solid = false;
         s.player_audio = false;
+        s.order = [Element::Visual, Element::Controls, Element::Text, Element::Artwork];
+        s.two_lines = false;
+        s.gradient = true;
+        s.gradient_end = 0;
+        s.card = false;
         s.accent = 0;
         s.custom_colors = std::array::from_fn(|i| i as u32 * 0x010203);
         assert!(s.save(&path).is_err());
@@ -321,6 +390,14 @@ mod tests {
         let invalid =
             Settings::parse("controls=no\nmenu_button=-1\ntransparent=x\nfull_height=2\nsolid=x\nplayer_audio=no");
         assert_eq!(invalid, Settings::default());
+        for order in [
+            "text,text,visual,controls",
+            "artwork,text,visual",
+            "artwork,text,visual,controls,text",
+            "bad,text,visual,controls",
+        ] {
+            assert_eq!(Settings::parse(&format!("order={order}")).order, Element::ALL);
+        }
         for colors in [
             "",
             "000000",

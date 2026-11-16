@@ -49,6 +49,7 @@ struct AudioConfig {
     generation: u64,
     visible: bool,
     playing: bool,
+    card_visible: bool,
     segment: Arc<Event>,
 }
 
@@ -117,6 +118,7 @@ impl Runtime {
                 generation: 0,
                 visible: false,
                 playing: false,
+                card_visible: false,
                 segment: Arc::new(Event::new()?),
             }),
             audio_wake: Wake::new()?,
@@ -210,10 +212,18 @@ impl Runtime {
             self.shared.notify();
         }
         if artwork_changed {
-            self.shared.wake.signal(COMMAND | media::MEDIA);
+            self.shared.wake.signal(COMMAND);
         }
     }
 
+    pub(crate) fn set_card_visible(&self, visible: bool) {
+        let mut audio = lock(&self.shared.audio);
+        let before = audio.settings.artwork || audio.card_visible;
+        audio.card_visible = visible;
+        if before != (audio.settings.artwork || visible) {
+            self.shared.wake.signal(COMMAND);
+        }
+    }
     pub fn command(&self, command: media::Command) -> Result<()> {
         if self.shared.stop.wait(0)? {
             return Err(Error::new("engine has stopped", E_ABORT));
@@ -416,7 +426,10 @@ fn run_media(shared: &Arc<Shared>) -> Result<()> {
             Ok(())
         },
         |properties, invalidated, revision| {
-            let enabled = lock(&shared.audio).settings.artwork;
+            let enabled = {
+                let config = lock(&shared.audio);
+                config.settings.artwork || config.card_visible
+            };
             let key = (revision, enabled);
             if key != artwork_key {
                 artwork_key = key;
@@ -534,6 +547,7 @@ mod tests {
             generation: 0,
             visible: false,
             playing: false,
+            card_visible: false,
             segment: Arc::new(Event::new().unwrap()),
         };
         for visible in [false, true] {

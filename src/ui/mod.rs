@@ -1,12 +1,14 @@
 //! One native view for the standalone window and the taskbar container.
 pub(crate) mod api;
+mod card;
 mod lang;
 mod rebar;
+mod text;
 use crate::media::{Command, Playback};
 use crate::platform::ffi::{E_FAIL, Raw};
 use crate::platform::{Error, Result};
 use crate::runtime::{Runtime, State};
-use crate::settings::{self, Language, Settings, Theme, Visual};
+use crate::settings::{self, Element, Language, Settings, Theme, Visual};
 use api::*;
 use std::cell::RefCell;
 use std::ptr::{null, null_mut};
@@ -19,109 +21,18 @@ const WM_FOCUS_CHANGED: u32 = 0x8000 + 49;
 const WM_BAND_SHOWN: u32 = 0x8000 + 50;
 const WM_BAND_RESIZE: u32 = 0x8000 + 51;
 const WM_PICK_COLOR: u32 = 0x8000 + 52;
+const WM_MOVE_BAND: u32 = 0x8000 + 53;
+const WM_CARD_ARM: u32 = 0x8000 + 54;
+const WM_CARD_HOVER: u32 = 0x8000 + 55;
+const WM_CARD_LEAVE: u32 = 0x8000 + 56;
+const WM_CARD_CLOSE: u32 = 0x8000 + 57;
+const WM_CARD_PIN: u32 = 0x8000 + 58;
+const CARD_LEAVE_TIMER: usize = 7003;
 const SAVE_RESIZE_TIMER: usize = 7002;
 static CLASS_MODULE: OnceLock<usize> = OnceLock::new();
 
-#[derive(Clone, Copy, Default)]
-struct Layout {
-    text: Rect,
-    visual: Rect,
-    artwork: Rect,
-    buttons: [Rect; 4],
-}
-impl Layout {
-    fn has_visual(&self) -> bool {
-        self.visual.width() > 0 && self.visual.height() > 0
-    }
-    fn new(w: i32, h: i32, dpi: u32, settings: &Settings) -> Self {
-        if w <= 0 || h <= 0 {
-            return Self::default();
-        }
-        let scale = |v: i32| ((v as i64 * dpi as i64 + 48) / 96) as i32;
-        let gap = scale(6);
-        let row = h.min(scale(40));
-        let side = scale(30).min(row).min(w);
-        let enabled = |i| if i == 3 { settings.menu_button } else { settings.controls };
-        let mut r = Self::default();
-        if w < scale(120) && h > scale(80) {
-            let mut x = 0;
-            for i in [1, 3, 0, 2].into_iter().filter(|&i| enabled(i)) {
-                if x + side > w {
-                    break;
-                }
-                r.buttons[i] = Rect { left: x, top: h - side, right: x + side, bottom: h };
-                x += side;
-            }
-            let bottom = if x > 0 { h - side - gap } else { h };
-            let mut top = 0;
-            let size = w.min((bottom - scale(32) - gap).max(0));
-            if settings.artwork && size >= scale(24) {
-                r.artwork = Rect { left: 0, top: 0, right: w, bottom: size };
-                top = size + gap;
-            }
-            r.text = Rect { left: gap, top, right: w - gap, bottom: (top + scale(32)).min(bottom) };
-            if settings.visual != Visual::Off && bottom > r.text.bottom + gap {
-                r.visual = Rect { left: 0, top: r.text.bottom + gap, right: w, bottom };
-            }
-            return r.bounded(w, h);
-        }
-        let min_content = scale(64).min(w);
-        let mut selected = [false; 4];
-        let mut count = 0;
-        for i in [1, 3, 0, 2].into_iter().filter(|&i| enabled(i)) {
-            if (count + 1) * side > w - min_content {
-                break;
-            }
-            selected[i] = true;
-            count += 1;
-        }
-        let right = w - count * side;
-        let mut x = right;
-        for (i, &show) in selected.iter().enumerate() {
-            if show {
-                let y = (row - side) / 2;
-                r.buttons[i] = Rect { left: x, top: y, right: x + side, bottom: y + side };
-                x += side;
-            }
-        }
-        let mut left = 0;
-        if settings.artwork && right >= scale(64) {
-            let cover_width = h.min((right - scale(96) - gap).max(scale(16)));
-            r.artwork = Rect { left: 0, top: 0, right: cover_width, bottom: h };
-            left = cover_width + gap;
-        }
-        let available = (right - left).max(0);
-        let vw = if settings.visual != Visual::Off && available >= scale(144) {
-            (available / 3).clamp(scale(48), scale(144))
-        } else {
-            0
-        };
-        let text_right = right - if vw > 0 { vw + gap } else { 0 };
-        let text_height = row.min(scale(32));
-        let text_top = (row - text_height) / 2;
-        r.text = Rect { left, top: text_top, right: text_right, bottom: text_top + text_height };
-        if vw > 0 {
-            r.visual = Rect { left: right - vw, top: 0, right, bottom: if settings.full_height { h } else { row } };
-        }
-        r.bounded(w, h)
-    }
-    fn bounded(mut self, w: i32, h: i32) -> Self {
-        for r in [&mut self.text, &mut self.visual, &mut self.artwork].into_iter().chain(self.buttons.iter_mut()) {
-            r.left = r.left.clamp(0, w);
-            r.top = r.top.clamp(0, h);
-            r.right = r.right.clamp(r.left, w);
-            r.bottom = r.bottom.clamp(r.top, h);
-        }
-        self
-    }
-    fn fit_text(&mut self, width: i32, dpi: u32) {
-        if self.visual.width() > 0 && self.text.right < self.visual.left {
-            let gap = ((4 * dpi + 48) / 96) as i32;
-            self.text.right = (self.text.left + width.max(0)).min(self.text.right);
-            self.visual.left = (self.text.right + gap).min(self.visual.right);
-        }
-    }
-}
+mod layout;
+use layout::Layout;
 
 fn solid_wave(
     wave: &[crate::visual::Range; crate::visual::POINTS],
@@ -247,6 +158,17 @@ impl Drop for CompositedPaint {
     }
 }
 impl Buffer {
+    fn from_image(image: &crate::Image) -> Option<Self> {
+        let result = Self::new(null_mut(), image.width as i32, image.height as i32)?;
+        if image.pixels.len() != image.width as usize * image.height as usize * 4 {
+            return None;
+        }
+        // SAFETY: the checked destination DIB has exactly the source's byte length.
+        unsafe {
+            std::ptr::copy_nonoverlapping(image.pixels.as_ptr(), result.bits.cast::<u8>(), image.pixels.len());
+        }
+        Some(result)
+    }
     fn new(dc: Raw, width: i32, height: i32) -> Option<Self> {
         if width <= 0 || height <= 0 || width as i64 * height as i64 > 2_097_152 {
             return None;
@@ -312,6 +234,18 @@ struct View {
     buffer: Option<Buffer>,
     cover: Option<(std::sync::Arc<crate::Image>, Buffer)>,
     font: Raw,
+    small_font: Raw,
+    text_engine: Option<text::Engine>,
+    title_cache: text::Cached,
+    artist_cache: text::Cached,
+    gradient_buffer: Option<Buffer>,
+    gradient_palette: [u32; 256],
+    drag: Option<Element>,
+    drop_target: Option<Element>,
+    card: Option<card::Card>,
+    card_pinned: bool,
+    mouse_track: Raw,
+    menu_open: bool,
     dark: bool,
     contrast: bool,
     visible: bool,
@@ -335,8 +269,10 @@ struct View {
 impl Drop for View {
     fn drop(&mut self) {
         self.runtime.take();
+        self.card.take();
         self.buffer.take();
         self.cover.take();
+        self.gradient_buffer.take();
         // SAFETY: owned hook/font; unhook before the view pointer is destroyed.
         unsafe {
             if !self.hook.is_null() {
@@ -348,6 +284,9 @@ impl Drop for View {
             }
             if !self.font.is_null() {
                 DeleteObject(self.font);
+            }
+            if !self.small_font.is_null() {
+                DeleteObject(self.small_font);
             }
             BufferedPaintUnInit();
         }
@@ -411,6 +350,18 @@ pub(crate) fn create(parent: Raw) -> Result<Raw> {
         buffer: None,
         cover: None,
         font: null_mut(),
+        small_font: null_mut(),
+        text_engine: None,
+        title_cache: text::Cached::default(),
+        artist_cache: text::Cached::default(),
+        gradient_buffer: None,
+        gradient_palette: [0; 256],
+        drag: None,
+        drop_target: None,
+        card: None,
+        card_pinned: false,
+        mouse_track: null_mut(),
+        menu_open: false,
         dark: false,
         contrast: false,
         visible: false,
@@ -476,6 +427,7 @@ pub fn report_startup_error(error: &(dyn std::error::Error + 'static)) {
 
 /// Optional shutdown deadline for explicit lifecycle checks; no periodic frame timer.
 pub fn run_for(duration: Option<std::time::Duration>) -> Result<()> {
+    let _apartment = crate::platform::com::Apartment::sta()?;
     // SAFETY: set only in the standalone process, before creating its first HWND.
     unsafe {
         SetProcessDpiAwarenessContext(-4);
@@ -526,6 +478,24 @@ unsafe extern "system" fn button_proc(hwnd: Raw, message: u32, w: usize, l: isiz
         if message == 0x0014 {
             return 1; // Owner draw supplies the complete background, including transparent pixels.
         }
+        if message == 0x0201 && GetKeyState(0x12) < 0 {
+            let parent = GetParent(hwnd);
+            let mut point = Point { x: l as i16 as i32, y: (l >> 16) as i16 as i32 };
+            MapWindowPoints(hwnd, parent, &mut point, 1);
+            return SendMessageW(parent, message, w, ((point.y as u16 as u32) << 16 | point.x as u16 as u32) as isize);
+        }
+        if matches!(message, 0x0200 | 0x02a1 | 0x02a3) {
+            PostMessageW(
+                GetParent(hwnd),
+                match message {
+                    0x0200 => WM_CARD_ARM,
+                    0x02a1 => WM_CARD_HOVER,
+                    _ => WM_CARD_LEAVE,
+                },
+                if message == 0x02a1 { 0 } else { hwnd as usize },
+                0,
+            );
+        }
         if message == 0x0082 {
             RemoveWindowSubclass(hwnd, button_proc, id);
         }
@@ -575,7 +545,7 @@ fn dispatch(hwnd: Raw, message: u32, w: usize, l: isize) -> isize {
         if message == WM_PICK_COLOR {
             let (accent, mut colors) = {
                 let view = (*pointer).borrow();
-                (view.settings.accent, view.settings.custom_colors)
+                (if w == 1 { view.settings.gradient_end } else { view.settings.accent }, view.settings.custom_colors)
             };
             let mut dialog = ChooseColor {
                 size: size_of::<ChooseColor>() as u32,
@@ -598,17 +568,56 @@ fn dispatch(hwnd: Raw, message: u32, w: usize, l: isize) -> isize {
                 if error != 0 {
                     view.notice = Some(format!("{} (0x{error:08X})", lang::text(view.settings.language).color_error));
                     PostMessageW(hwnd, WM_NOTICE, 0, 0);
-                } else if colors != view.settings.custom_colors || selected && dialog.result != view.settings.accent {
+                } else if colors != view.settings.custom_colors || selected && dialog.result != accent {
                     view.settings.custom_colors = colors;
                     if selected {
-                        view.settings.accent = dialog.result & 0xffffff;
+                        if w == 1 {
+                            view.settings.gradient_end = dialog.result & 0xffffff;
+                        } else {
+                            view.settings.accent = dialog.result & 0xffffff;
+                        }
                     }
                     view.save_settings();
+                    view.prepare_resources();
                     InvalidateRect(hwnd, &view.layout.visual, 0);
                     for &button in &view.buttons {
                         InvalidateRect(button, null(), 0);
                     }
                 }
+            }
+            return 0;
+        }
+        if message == WM_MOVE_BAND {
+            // No View borrow crosses native shell layout and possible synchronous destruction.
+            let result = rebar::move_band(hwnd, w as u32);
+            let pointer = GetWindowLongPtrW(hwnd, -21) as *const RefCell<View>;
+            if !pointer.is_null()
+                && let Err(error) = result
+                && let Ok(mut view) = (*pointer).try_borrow_mut()
+            {
+                let t = lang::text(view.settings.language);
+                view.notice = Some(if error.code == 0x80070005u32 as i32 {
+                    t.move_locked.to_owned()
+                } else {
+                    format!("{} (0x{:08X})", t.move_error, error.code as u32)
+                });
+                PostMessageW(hwnd, WM_NOTICE, 0, 0);
+            }
+            return 0;
+        }
+        if message == WM_CARD_HOVER || message == WM_CARD_PIN {
+            let ready = {
+                let Ok(mut view) = (*pointer).try_borrow_mut() else {
+                    return 0;
+                };
+                if view.drag.is_some() {
+                    None
+                } else {
+                    view.open_card(w != 0 || message == WM_CARD_PIN, message == WM_CARD_PIN)
+                }
+            };
+            if let Some((hwnd, pinned)) = ready {
+                card::Card::show(hwnd, pinned);
             }
             return 0;
         }
@@ -659,8 +668,13 @@ fn dispatch(hwnd: Raw, message: u32, w: usize, l: isize) -> isize {
             return DefWindowProcW(hwnd, message, w, l);
         }
         if message == 0x007b || (message == 0x0111 && w & 0xffff == 104 && (w >> 16) & 0xffff == 0) {
-            let settings = (*pointer).borrow().settings.clone();
-            let standalone = (*pointer).borrow().standalone;
+            let (settings, standalone) = {
+                let mut view = (*pointer).borrow_mut();
+                view.close_card();
+                view.cancel_hover();
+                view.menu_open = true;
+                (view.settings.clone(), view.standalone)
+            };
             let mut point = Point::default();
             if message == 0x007b && l != -1 {
                 point.x = l as i16 as i32;
@@ -674,6 +688,7 @@ fn dispatch(hwnd: Raw, message: u32, w: usize, l: isize) -> isize {
             if !pointer.is_null()
                 && let Ok(mut view) = (*pointer).try_borrow_mut()
             {
+                view.menu_open = false;
                 view.setting(command);
             }
             return 0;
@@ -712,7 +727,6 @@ fn dispatch(hwnd: Raw, message: u32, w: usize, l: isize) -> isize {
                     }
                 }
                 view.update_text();
-                view.resize();
                 let root = GetAncestor(hwnd, 2);
                 let mut process = 0;
                 let thread = GetWindowThreadProcessId(root, &mut process);
@@ -739,8 +753,8 @@ fn dispatch(hwnd: Raw, message: u32, w: usize, l: isize) -> isize {
                     view.state = next;
                     if chrome_changed || artwork_changed {
                         view.update_text();
-                        view.resize();
                         view.visibility();
+                        view.refresh_card();
                         InvalidateRect(hwnd, null(), 0);
                     } else {
                         InvalidateRect(hwnd, &view.layout.visual, 0);
@@ -770,6 +784,7 @@ fn dispatch(hwnd: Raw, message: u32, w: usize, l: isize) -> isize {
                     view.visibility();
                     PostMessageW(hwnd, WM_BAND_RESIZE, 0, 0);
                 } else {
+                    view.close_card();
                     view.restart_pending = false;
                     if let Some(runtime) = &view.runtime {
                         runtime.request_restart();
@@ -785,6 +800,7 @@ fn dispatch(hwnd: Raw, message: u32, w: usize, l: isize) -> isize {
                 view.buffer.take();
                 view.resize();
                 view.visibility();
+                view.refresh_card();
                 if !view.standalone && rebar::dragging(hwnd) {
                     let mut rect = Rect::default();
                     GetClientRect(hwnd, &mut rect);
@@ -822,12 +838,14 @@ fn dispatch(hwnd: Raw, message: u32, w: usize, l: isize) -> isize {
                     SetWindowPos(hwnd, null_mut(), r.left, r.top, r.width(), r.height(), 0x14);
                 }
                 view.resize();
+                view.refresh_card();
                 InvalidateRect(hwnd, null(), 0);
                 0
             }
             0x02e3 => {
                 view.style();
                 view.resize();
+                view.refresh_card();
                 if !view.standalone {
                     PostMessageW(hwnd, WM_BAND_RESIZE, 0, 0);
                 }
@@ -837,6 +855,7 @@ fn dispatch(hwnd: Raw, message: u32, w: usize, l: isize) -> isize {
             0x001a | 0x031a | 0x0015 => {
                 view.style();
                 view.update_text();
+                view.refresh_card();
                 InvalidateRect(hwnd, null(), 0);
                 0
             }
@@ -881,6 +900,95 @@ fn dispatch(hwnd: Raw, message: u32, w: usize, l: isize) -> isize {
                     InvalidateRect(hwnd, null(), 0);
                 }
                 0
+            }
+            0x0201 if GetKeyState(0x12) < 0 => {
+                view.close_card();
+                let point = Point { x: l as i16 as i32, y: (l >> 16) as i16 as i32 };
+                view.drag = view.layout.hit(point);
+                if view.drag.is_some() {
+                    SetCapture(hwnd);
+                }
+                0
+            }
+            0x0200 if view.drag.is_some() => {
+                let target = view.layout.hit(Point { x: l as i16 as i32, y: (l >> 16) as i16 as i32 });
+                if view.drop_target != target {
+                    view.drop_target = target;
+                    InvalidateRect(hwnd, null(), 0);
+                }
+                0
+            }
+            0x0200 => {
+                view.arm_hover(hwnd);
+                0
+            }
+            WM_CARD_ARM => {
+                view.arm_hover(w as Raw);
+                0
+            }
+            0x02a1 => {
+                PostMessageW(hwnd, WM_CARD_HOVER, 0, 0);
+                0
+            }
+            0x0201 => {
+                PostMessageW(hwnd, WM_CARD_HOVER, 1, 0);
+                0
+            }
+            0x02a3 | WM_CARD_LEAVE => {
+                if message == 0x02a3 || view.mouse_track == w as Raw {
+                    view.mouse_track = null_mut();
+                }
+                if view.card.is_some() && !view.card_pinned {
+                    SetTimer(hwnd, CARD_LEAVE_TIMER, 160, null_mut());
+                }
+                0
+            }
+            WM_CARD_CLOSE => {
+                if w == 0 || view.card.as_ref().is_some_and(|c| c.hwnd() == w as Raw) {
+                    view.close_card();
+                }
+                0
+            }
+            0x0113 if w == CARD_LEAVE_TIMER => {
+                KillTimer(hwnd, CARD_LEAVE_TIMER);
+                let mut point = Point::default();
+                let mut bounds = Rect::default();
+                GetCursorPos(&mut point);
+                GetWindowRect(hwnd, &mut bounds);
+                let inside = point.x >= bounds.left
+                    && point.x < bounds.right
+                    && point.y >= bounds.top
+                    && point.y < bounds.bottom;
+                if !view.card_pinned && !inside && !view.card.as_ref().is_some_and(|c| c.contains(point)) {
+                    view.close_card();
+                }
+                0
+            }
+            0x0202 if view.drag.is_some() => {
+                let element = view.drag.take().unwrap();
+                let target = view.drop_target.take();
+                if GetCapture() == hwnd {
+                    ReleaseCapture();
+                }
+                if let Some(target) = target {
+                    let index = view.settings.order.iter().position(|&e| e == target).unwrap_or(0);
+                    let old = view.settings.order;
+                    layout::reorder(&mut view.settings.order, element, index);
+                    if old != view.settings.order {
+                        view.save_settings();
+                        view.resize();
+                        view.visibility();
+                    }
+                }
+                InvalidateRect(hwnd, null(), 0);
+                0
+            }
+            0x0215 | 0x001f => {
+                view.drag = None;
+                view.drop_target = None;
+                InvalidateRect(hwnd, null(), 0);
+                drop(view);
+                DefWindowProcW(hwnd, message, w, l)
             }
             0x002b => {
                 view.draw_button(&*(l as *const DrawItem));
@@ -933,6 +1041,185 @@ fn dispatch(hwnd: Raw, message: u32, w: usize, l: isize) -> isize {
 }
 
 impl View {
+    fn arm_hover(&mut self, target: Raw) {
+        // SAFETY: event-based tracking of our own view, buttons or popup, on their owning thread.
+        unsafe {
+            KillTimer(self.hwnd, CARD_LEAVE_TIMER);
+            if self.card.as_ref().is_some_and(|c| c.hwnd() == target) {
+                return;
+            }
+            if !self.settings.card || self.menu_open || self.mouse_track == target || self.drag.is_some() {
+                return;
+            }
+            let mut track = MouseTrack { size: size_of::<MouseTrack>() as u32, flags: 1 | 2, hwnd: target, hover: 450 };
+            if TrackMouseEvent(&mut track) != 0 {
+                self.mouse_track = target;
+            }
+        }
+    }
+    fn cancel_hover(&mut self) {
+        if !self.mouse_track.is_null() {
+            // SAFETY: cancel only tracking armed by this view, without a persistent timer.
+            unsafe {
+                let mut track = MouseTrack {
+                    size: size_of::<MouseTrack>() as u32,
+                    flags: 0x80000003,
+                    hwnd: self.mouse_track,
+                    hover: 0,
+                };
+                TrackMouseEvent(&mut track);
+            }
+            self.mouse_track = null_mut();
+        }
+    }
+    fn close_card(&mut self) {
+        // SAFETY: only transient leave/hover tracking is cancelled; there is no periodic card timer.
+        unsafe {
+            KillTimer(self.hwnd, CARD_LEAVE_TIMER);
+        }
+        self.card_pinned = false;
+        self.card.take();
+        if let Some(runtime) = &self.runtime {
+            runtime.set_card_visible(false);
+        }
+    }
+    fn refresh_card(&mut self) {
+        let Some(card) = &mut self.card else {
+            return;
+        };
+        let Some(engine) = &self.text_engine else {
+            return;
+        };
+        let mut anchor = Rect::default();
+        // SAFETY: screen coordinates are used only for the requested popup, never to position the band.
+        unsafe {
+            GetWindowRect(self.hwnd, &mut anchor);
+        }
+        let album = wide(self.state.snapshot.as_ref().map_or("", |s| s.album.as_str()));
+        let colors = if self.contrast {
+            // SAFETY: system high contrast colours are queried synchronously.
+            unsafe { (GetSysColor(5), GetSysColor(8), GetSysColor(8)) }
+        } else if self.dark {
+            (0x222020, 0xf8f6f3, 0xaaa7a1)
+        } else {
+            (0xf7f7f7, 0x242424, 0x686868)
+        };
+        if let Err(error) = card.update(
+            engine,
+            &self.title,
+            &self.artist,
+            &album,
+            self.state.artwork.as_ref(),
+            anchor,
+            self.dpi,
+            colors,
+        ) {
+            if self.card_pinned {
+                self.report_card_error(error);
+            }
+            self.close_card();
+        }
+    }
+    fn report_card_error(&mut self, error: Error) {
+        self.notice = Some(format!("{} (0x{:08X})", lang::text(self.settings.language).card_error, error.code as u32));
+        // SAFETY: a failure message opens only after this View borrow has ended.
+        unsafe {
+            PostMessageW(self.hwnd, WM_NOTICE, 0, 0);
+        }
+    }
+    fn open_card(&mut self, pinned: bool, force_pin: bool) -> Option<(Raw, bool)> {
+        if !self.visible || self.menu_open || !self.settings.card && !pinned {
+            return None;
+        }
+        if self.card_pinned {
+            if pinned && !force_pin {
+                self.close_card();
+            }
+            return None;
+        }
+        if self.card.is_none() {
+            if self.text_engine.is_none() {
+                match text::Engine::new() {
+                    Ok(engine) => self.text_engine = Some(engine),
+                    Err(error) => {
+                        if pinned {
+                            self.report_card_error(error);
+                        }
+                        return None;
+                    }
+                }
+            }
+            match card::Card::new(self.hwnd) {
+                Ok(card) => self.card = Some(card),
+                Err(error) => {
+                    if pinned {
+                        self.report_card_error(error);
+                    }
+                    return None;
+                }
+            }
+        }
+        self.card_pinned = pinned;
+        self.refresh_card();
+        let card = self.card.as_ref()?;
+        if let Some(runtime) = &self.runtime {
+            runtime.set_card_visible(true);
+        }
+        Some((card.hwnd(), pinned))
+    }
+    fn prepare_resources(&mut self) {
+        let area = self.layout.artwork;
+        match &self.state.artwork {
+            Some(image) if area.width() > 0 && area.height() > 0 => {
+                let changed = self.cover.as_ref().is_none_or(|(old, buffer)| {
+                    !std::sync::Arc::ptr_eq(image, old)
+                        || buffer.width != area.width()
+                        || buffer.height != area.height()
+                });
+                if changed {
+                    match make_cover(image, area) {
+                        Ok(buffer) => self.cover = Some((image.clone(), buffer)),
+                        Err(error) => {
+                            self.cover = None;
+                            self.state.artwork_error = Some(error);
+                        }
+                    }
+                }
+            }
+            _ => self.cover = None,
+        }
+        let (_, foreground, muted, _) = self.colors();
+        let title = self.layout.title();
+        let artist = self.layout.artist();
+        self.title_cache.update(
+            self.text_engine.as_ref(),
+            &self.title,
+            title,
+            text::Style {
+                dpi: self.dpi,
+                size: if artist.height() > 0 { 15. } else { 16. },
+                weight: 600,
+                color: foreground,
+                wrap: false,
+            },
+        );
+        self.artist_cache.update(
+            self.text_engine.as_ref(),
+            &self.artist,
+            artist,
+            text::Style { dpi: self.dpi, size: 12., weight: 400, color: muted, wrap: false },
+        );
+        if self.settings.gradient && !self.contrast && self.layout.has_visual() {
+            let area = self.layout.visual;
+            if self.gradient_buffer.as_ref().is_none_or(|b| b.width != area.width() || b.height != area.height()) {
+                self.gradient_buffer = Buffer::new(null_mut(), area.width(), area.height());
+            }
+            self.gradient_palette =
+                std::array::from_fn(|i| mix_color(self.settings.accent, self.settings.gradient_end, i as u32, 255));
+        } else {
+            self.gradient_buffer = None;
+        }
+    }
     fn start_runtime(&mut self) {
         match Runtime::start(self.hwnd, &self.settings) {
             Ok(runtime) => {
@@ -1071,6 +1358,28 @@ impl View {
                 FreeLibrary(theme);
             }
             let font = CreateFontW(
+                -((((if self.settings.two_lines { 15 } else { 16 }) * self.dpi + 48) / 96) as i32),
+                0,
+                0,
+                0,
+                600,
+                0,
+                0,
+                0,
+                1,
+                0,
+                0,
+                4,
+                0,
+                wide("Segoe UI").as_ptr(),
+            );
+            if !font.is_null() {
+                if !self.font.is_null() {
+                    DeleteObject(self.font);
+                }
+                self.font = font;
+            }
+            let font = CreateFontW(
                 -(((12 * self.dpi + 48) / 96) as i32),
                 0,
                 0,
@@ -1087,10 +1396,13 @@ impl View {
                 wide("Segoe UI").as_ptr(),
             );
             if !font.is_null() {
-                if !self.font.is_null() {
-                    DeleteObject(self.font);
+                if !self.small_font.is_null() {
+                    DeleteObject(self.small_font);
                 }
-                self.font = font;
+                self.small_font = font;
+            }
+            if self.text_engine.is_none() {
+                self.text_engine = text::Engine::new().ok();
             }
             if self.standalone {
                 let dark = i32::from(self.dark);
@@ -1121,7 +1433,11 @@ impl View {
             if !dc.is_null() {
                 let old = SelectObject(dc, self.font);
                 let mut width = 0;
-                for text in [&self.title, &self.artist] {
+                for (i, text) in [&self.title, &self.artist].into_iter().enumerate() {
+                    if i == 1 && self.layout.artist().height() == 0 {
+                        continue;
+                    }
+                    SelectObject(dc, if i == 0 { self.font } else { self.small_font });
                     if text.len() < 2 {
                         continue;
                     }
@@ -1139,6 +1455,7 @@ impl View {
                 ReleaseDC(self.hwnd, dc);
                 self.layout.fit_text(width + ((2 * self.dpi + 48) / 96) as i32, self.dpi);
             }
+            self.prepare_resources();
             let changed: [bool; 4] = std::array::from_fn(|i| {
                 let hwnd = self.buttons[i];
                 let r = self.layout.buttons[i];
@@ -1207,6 +1524,7 @@ impl View {
                 InvalidateRect(self.buttons[i], null(), 0);
             }
         }
+        self.resize();
     }
     fn visibility(&mut self) {
         // SAFETY: visibility queries and monitor geometry contain no borrowed pointers after return.
@@ -1231,6 +1549,10 @@ impl View {
                 && !self.locked
         };
         self.visible = visible;
+        if !visible {
+            self.close_card();
+            self.cancel_hover();
+        }
         if let Some(runtime) = &self.runtime {
             runtime.configure(&self.settings, visible && self.layout.has_visual());
         }
@@ -1245,22 +1567,6 @@ impl View {
             }
             let mut r = Rect::default();
             GetClientRect(self.hwnd, &mut r);
-            match &self.state.artwork {
-                Some(image)
-                    if self.cover.as_ref().is_none_or(|(previous, _)| !std::sync::Arc::ptr_eq(image, previous)) =>
-                {
-                    self.cover = Buffer::new(dc, image.width as i32, image.height as i32).map(|buffer| {
-                        std::ptr::copy_nonoverlapping(
-                            image.pixels.as_ptr(),
-                            buffer.bits.cast::<u8>(),
-                            image.pixels.len(),
-                        );
-                        (image.clone(), buffer)
-                    });
-                }
-                None => self.cover = None,
-                _ => {}
-            }
             let mut composed = if self.composited { CompositedPaint::new(dc, paint.rect) } else { None };
             if self.transparent()
                 && let Some(buffer) = &mut composed
@@ -1314,12 +1620,11 @@ impl View {
         unsafe {
             let old = SelectObject(dc, self.font);
             SetBkMode(dc, 1);
-            if let Some((image, buffer)) = &self.cover
+            if let Some((_, buffer)) = &self.cover
                 && self.layout.artwork.intersects(dirty)
             {
                 let area = self.layout.artwork;
                 if area.width() > 0 && area.height() > 0 {
-                    let source = artwork_crop(image.width as i32, image.height as i32, area);
                     AlphaBlend(
                         dc,
                         area.left,
@@ -1327,82 +1632,86 @@ impl View {
                         area.width(),
                         area.height(),
                         buffer.dc,
-                        source.left,
-                        source.top,
-                        source.width(),
-                        source.height(),
+                        0,
+                        0,
+                        buffer.width,
+                        buffer.height,
                         0x01ff0000,
                     );
                 }
             }
-            let text = self.layout.text;
-            let two = text.height() >= (28 * self.dpi / 96) as i32;
-            let mut title = text;
-            if two {
-                title.bottom = title.top + title.height() / 2;
-            }
-            if title.intersects(dirty) {
-                label(dc, &self.title, title, if alpha { 0xffffff } else { foreground });
-                if let Some(paint) = paint {
-                    paint.colorize(title, foreground);
+            let title = self.layout.title();
+            let artist = self.layout.artist();
+            for (r, cache, value, color, font) in [
+                (title, &self.title_cache, &self.title, foreground, self.font),
+                (artist, &self.artist_cache, &self.artist, muted, self.small_font),
+            ] {
+                if r.width() == 0 || r.height() == 0 || !r.intersects(dirty) {
+                    continue;
                 }
-            }
-            if two && (Rect { top: title.bottom, ..text }).intersects(dirty) {
-                let area = Rect { top: title.bottom, ..text };
-                label(dc, &self.artist, area, if alpha { 0xffffff } else { muted });
-                if let Some(paint) = paint {
-                    paint.colorize(area, muted);
+                if let Some(raster) = &cache.raster {
+                    raster.draw(dc, r);
+                } else {
+                    SelectObject(dc, font);
+                    label(dc, value, r, if alpha { 0xffffff } else { color });
+                    if let Some(paint) = paint {
+                        paint.colorize(r, color);
+                    }
                 }
             }
             let visual = self.layout.visual;
             if visual.width() > 0 && visual.height() > 0 && visual.intersects(dirty) {
-                let old_pen = SelectObject(dc, GetStockObject(19));
-                let draw_color = if alpha { 0xffffff } else { accent };
-                SetDCPenColor(dc, draw_color);
-                let gain = self.settings.gain as f32 / 25.;
-                match self.settings.visual {
-                    Visual::Wave if self.settings.solid => {
-                        let points = solid_wave(&self.state.frame.wave, visual, gain);
-                        let previous_pen = SelectObject(dc, GetStockObject(8));
-                        let previous_brush = SelectObject(dc, GetStockObject(18));
-                        SetDCBrushColor(dc, draw_color);
-                        Polygon(dc, points.as_ptr(), points.len() as i32);
-                        SelectObject(dc, previous_pen);
-                        SelectObject(dc, previous_brush);
-                    }
-                    Visual::Wave => {
-                        for (i, range) in self.state.frame.wave.iter().enumerate() {
-                            let x = visual.left + (i as i32 * visual.width() / 64);
-                            let center = (visual.top + visual.bottom) / 2;
-                            let a = (visual.height() - 1) as f32 * 0.5;
-                            let low = (range.low * gain).clamp(-1., 1.);
-                            let high = (range.high * gain).clamp(-1., 1.);
-                            MoveToEx(dc, x, center - (high * a) as i32, null_mut());
-                            LineTo(dc, x, center - (low * a) as i32 + 1);
+                if let Some(buffer) = &self.gradient_buffer {
+                    let local = Rect { left: 0, top: 0, right: buffer.width, bottom: buffer.height };
+                    fill(buffer.dc, local, 0);
+                    self.draw_visual(buffer.dc, local, 0xffffff);
+                    GdiFlush();
+                    let pixels = std::slice::from_raw_parts_mut(
+                        buffer.bits.cast::<u32>(),
+                        (buffer.width * buffer.height) as usize,
+                    );
+                    for row in pixels.chunks_mut(buffer.width as usize) {
+                        for (x, pixel) in row.iter_mut().enumerate() {
+                            let a = *pixel & 255;
+                            *pixel = if a == 0 {
+                                0
+                            } else {
+                                text::premultiply(
+                                    self.gradient_palette[x * 255 / (buffer.width as usize - 1).max(1)],
+                                    a,
+                                )
+                            };
                         }
                     }
-                    Visual::Spectrum => {
-                        for (i, band) in self.state.frame.bands.iter().enumerate() {
-                            let x = visual.left + i as i32 * visual.width() / 32;
-                            let right = visual.left + (i as i32 + 1) * visual.width() / 32;
-                            let height = (crate::visual::spectrum_height(*band, gain) * visual.height() as f32) as i32;
-                            fill(
-                                dc,
-                                Rect {
-                                    left: x,
-                                    top: visual.bottom - height,
-                                    right: (right - i32::from(!self.settings.solid)).max(x + 1).min(visual.right),
-                                    bottom: visual.bottom,
-                                },
-                                draw_color,
-                            );
-                        }
+                    AlphaBlend(
+                        dc,
+                        visual.left,
+                        visual.top,
+                        buffer.width,
+                        buffer.height,
+                        buffer.dc,
+                        0,
+                        0,
+                        buffer.width,
+                        buffer.height,
+                        0x01ff0000,
+                    );
+                } else {
+                    self.draw_visual(dc, visual, if alpha { 0xffffff } else { accent });
+                    if let Some(paint) = paint {
+                        paint.colorize(visual, accent);
                     }
-                    Visual::Off => {}
                 }
-                SelectObject(dc, old_pen);
+            }
+            if let Some(target) = self.drop_target {
+                let r = self.layout.element(target);
+                fill(
+                    dc,
+                    Rect { right: r.left + ((2 * self.dpi + 48) / 96) as i32, ..r },
+                    if alpha { 0xffffff } else { accent },
+                );
                 if let Some(paint) = paint {
-                    paint.colorize(visual, accent);
+                    paint.colorize(Rect { right: r.left + ((2 * self.dpi + 48) / 96) as i32, ..r }, accent);
                 }
             }
             SelectObject(dc, old);
@@ -1487,6 +1796,53 @@ impl View {
             paint.colorize(item.rect, actual_color);
         }
     }
+    fn draw_visual(&self, dc: Raw, area: Rect, color: u32) {
+        // SAFETY: owned paint/memory DC; stock GDI objects are restored on every path.
+        unsafe {
+            let pen = SelectObject(dc, GetStockObject(19));
+            SetDCPenColor(dc, color);
+            let gain = self.settings.gain as f32 / 25.;
+            match self.settings.visual {
+                Visual::Wave if self.settings.solid => {
+                    let points = solid_wave(&self.state.frame.wave, area, gain);
+                    let old_pen = SelectObject(dc, GetStockObject(8));
+                    let brush = SelectObject(dc, GetStockObject(18));
+                    SetDCBrushColor(dc, color);
+                    Polygon(dc, points.as_ptr(), points.len() as i32);
+                    SelectObject(dc, old_pen);
+                    SelectObject(dc, brush);
+                }
+                Visual::Wave => {
+                    for (i, range) in self.state.frame.wave.iter().enumerate() {
+                        let x = area.left + i as i32 * area.width() / 64;
+                        let center = (area.top + area.bottom) / 2;
+                        let a = (area.height() - 1) as f32 * 0.5;
+                        MoveToEx(dc, x, center - ((range.high * gain).clamp(-1., 1.) * a) as i32, null_mut());
+                        LineTo(dc, x, center - ((range.low * gain).clamp(-1., 1.) * a) as i32 + 1);
+                    }
+                }
+                Visual::Spectrum => {
+                    for (i, band) in self.state.frame.bands.iter().enumerate() {
+                        let x = area.left + i as i32 * area.width() / 32;
+                        let right = area.left + (i as i32 + 1) * area.width() / 32;
+                        let height = (crate::visual::spectrum_height(*band, gain) * area.height() as f32) as i32;
+                        fill(
+                            dc,
+                            Rect {
+                                left: x,
+                                top: area.bottom - height,
+                                right: (right - i32::from(!self.settings.solid)).max(x + 1).min(area.right),
+                                bottom: area.bottom,
+                            },
+                            color,
+                        );
+                    }
+                }
+                Visual::Off => {}
+            }
+            SelectObject(dc, pen);
+        }
+    }
     fn setting(&mut self, id: u32) {
         let old = self.settings.clone();
         let width_requested = matches!(id, 260..=262);
@@ -1517,7 +1873,41 @@ impl View {
             305 => self.settings.solid = !self.settings.solid,
             306 => self.settings.player_audio = true,
             307 => self.settings.player_audio = false,
+            320 => self.settings.gradient = !self.settings.gradient,
+            321 => {
+                // SAFETY: defer the modal colour dialog until the View borrow ends.
+                unsafe {
+                    PostMessageW(self.hwnd, WM_PICK_COLOR, 1, 0);
+                }
+                return;
+            }
+            322 => self.settings.two_lines = false,
+            323 => self.settings.two_lines = true,
+            324 => {
+                self.settings.card = !self.settings.card;
+                self.close_card();
+            }
+            325 => {
+                // SAFETY: opening the card can activate a native popup, outside this View borrow.
+                unsafe {
+                    PostMessageW(self.hwnd, WM_CARD_HOVER, 1, 0);
+                }
+                return;
+            }
+            330..=333 => {
+                // SAFETY: native rebar callbacks run after this borrow is released.
+                unsafe {
+                    PostMessageW(self.hwnd, WM_MOVE_BAND, (id - 330) as usize, 0);
+                }
+                return;
+            }
+            400..=415 => layout::reorder(
+                &mut self.settings.order,
+                Element::ALL[((id - 400) / 4) as usize],
+                ((id - 400) % 4) as usize,
+            ),
             290 => {
+                self.close_card();
                 if self.runtime.as_ref().is_some_and(|r| r.wait_stopped(std::time::Duration::ZERO).unwrap_or(false)) {
                     self.runtime.take();
                     self.start_runtime();
@@ -1542,7 +1932,7 @@ impl View {
         }
         if self.settings != old {
             self.save_settings();
-            if self.settings.theme != old.theme {
+            if self.settings.theme != old.theme || self.settings.two_lines != old.two_lines {
                 self.style();
                 // SAFETY: theme changes invalidate owner-drawn buttons without erasing them.
                 unsafe {
@@ -1554,16 +1944,19 @@ impl View {
             let language_changed = self.settings.language != old.language;
             if language_changed {
                 self.update_text();
-            }
-            if language_changed
-                || self.settings.full_height != old.full_height
+            } else if self.settings.full_height != old.full_height
                 || self.settings.artwork != old.artwork
                 || self.settings.controls != old.controls
                 || self.settings.menu_button != old.menu_button
+                || self.settings.order != old.order
+                || self.settings.two_lines != old.two_lines
             {
                 self.resize();
+            } else {
+                self.prepare_resources();
             }
             self.visibility();
+            self.refresh_card();
             if !width_requested && !self.standalone && self.settings.full_height != old.full_height {
                 // SAFETY: notify outside the current View borrow.
                 unsafe {
@@ -1668,11 +2061,29 @@ pub(crate) fn unregister_class() {
     if let Some(&module) = CLASS_MODULE.get() {
         // SAFETY: called by DllCanUnloadNow only when no window/callback activity remains.
         unsafe {
+            card::unregister(module as Raw);
             UnregisterClassW(wide(CLASS).as_ptr(), module as Raw);
         }
     }
 }
 
+fn make_cover(image: &crate::Image, area: Rect) -> Result<Buffer> {
+    let crop = artwork_crop(image.width as i32, image.height as i32, area);
+    let scaled = crate::artwork::resize(
+        image,
+        [crop.left, crop.top, crop.width(), crop.height()],
+        area.width() as u32,
+        area.height() as u32,
+    )?;
+    Buffer::from_image(&scaled).ok_or(Error::new("allocate artwork pixels", E_FAIL))
+}
+fn mix_color(first: u32, last: u32, step: u32, count: u32) -> u32 {
+    [0, 8, 16].into_iter().fold(0, |result, shift| {
+        let a = (first >> shift) & 255;
+        let b = (last >> shift) & 255;
+        result | ((a * (count - step) + b * step + count / 2) / count.max(1)) << shift
+    })
+}
 fn fill(dc: Raw, r: Rect, color: u32) {
     if r.width() == 0 || r.height() == 0 {
         return;
@@ -1729,6 +2140,8 @@ fn popup(hwnd: Raw, s: &Settings, point: Point, standalone: bool) -> u32 {
         visual.item(200 + i as u32, label, s.visual as usize == i);
     }
     visual.item(305, t.solid, s.solid);
+    visual.item(320, t.gradient, s.gradient);
+    visual.item(321, t.gradient_end, false);
     menu.submenu(t.visual, visual);
     let audio = Menu::new();
     audio.item(306, t.player_audio, s.player_audio);
@@ -1744,6 +2157,27 @@ fn popup(hwnd: Raw, s: &Settings, point: Point, standalone: bool) -> u32 {
         language.item(220 + i as u32, label, s.language as usize == i);
     }
     menu.submenu(t.language, language);
+    let text = Menu::new();
+    text.item(322, t.one_line, !s.two_lines);
+    text.item(323, t.two_lines, s.two_lines);
+    menu.submenu(t.text, text);
+    let order = Menu::new();
+    for e in Element::ALL {
+        let sub = Menu::new();
+        let position = s.order.iter().position(|&v| v == e).unwrap_or(0);
+        for i in 0..4 {
+            sub.item(400 + e as u32 * 4 + i, &format!("{}", i + 1), position == i as usize);
+        }
+        order.submenu([t.artwork, t.text, t.visual, t.controls][e as usize], sub);
+    }
+    menu.submenu(t.order, order);
+    if !standalone {
+        let position = Menu::new();
+        for (i, label) in [t.first, t.earlier, t.later, t.last].into_iter().enumerate() {
+            position.item(330 + i as u32, label, false);
+        }
+        menu.submenu(t.placement, position);
+    }
     let height = Menu::new();
     height.item(300, t.compact, !s.full_height);
     height.item(301, t.full_height, s.full_height);
@@ -1780,6 +2214,8 @@ fn popup(hwnd: Raw, s: &Settings, point: Point, standalone: bool) -> u32 {
     }
     menu.item(270, &format!("{}...", t.color), false);
     menu.item(280, t.artwork, s.artwork);
+    menu.item(324, t.card, s.card);
+    menu.item(325, t.show_card, false);
     menu.item(290, t.reconnect, false);
     if standalone {
         menu.item(291, t.close, false);
@@ -1938,7 +2374,7 @@ mod tests {
             Settings { artwork: false, full_height: true, controls: false, menu_button: false, ..Settings::default() };
         let full = Layout::new(360, 160, 96, &settings);
         assert!(full.buttons.iter().all(|r| r.width() == 0 && r.height() == 0));
-        assert_eq!(full.text.top, 4);
+        assert!(full.text.top >= 0 && full.text.bottom <= 40);
         assert_eq!(full.visual.top, 0);
         assert_eq!(full.visual.bottom, 160);
         assert_eq!(full.visual.right, 360);
@@ -1950,7 +2386,7 @@ mod tests {
         settings.full_height = false;
         let compact = Layout::new(360, 160, 96, &settings);
         assert_eq!(compact.visual.bottom, 40);
-        assert_eq!(compact.text.top, 4);
+        assert!(compact.text.top >= 0 && compact.text.bottom <= 40);
     }
     #[test]
     fn composited_paint_preserves_color_and_sets_opaque_alpha() {
@@ -1972,6 +2408,7 @@ mod tests {
     #[test]
     #[ignore = "requires an interactive Windows desktop; never registers a band or changes playback"]
     fn native_view_resize_theme_and_shutdown() {
+        let _apartment = crate::platform::com::Apartment::sta().unwrap();
         // SAFETY: an isolated hidden native container in the test process, not Explorer.
         unsafe {
             let parent = CreateWindowExW(
@@ -2044,6 +2481,8 @@ mod tests {
                 view.settings.controls = false;
                 view.settings.menu_button = false;
                 view.settings.transparent = true;
+                view.settings.gradient = true;
+                view.state.frame.bands = [0.3; 32];
                 view.resize();
                 assert!(view.layout.buttons.iter().all(|r| r.width() == 0));
                 let mut paint =
@@ -2073,6 +2512,23 @@ mod tests {
                 }
             }
             assert!(!(*pointer).borrow().visible);
+            {
+                let view = (*pointer).borrow();
+                let mut card = card::Card::new(hwnd).unwrap();
+                let anchor = Rect { left: 10, top: 1000, right: 370, bottom: 1040 };
+                card.update(
+                    view.text_engine.as_ref().unwrap(),
+                    &wide("Long title for the native media card"),
+                    &wide("Artist"),
+                    &wide("Album"),
+                    None,
+                    anchor,
+                    view.dpi,
+                    (0x202020, 0xffffff, 0xaaaaaa),
+                )
+                .unwrap();
+                assert_eq!(IsWindowVisible(card.hwnd()), 0, "preparing the card must not reveal or focus it");
+            }
             assert_ne!(DestroyWindow(hwnd), 0);
             assert_ne!(DestroyWindow(parent), 0);
             assert!(done.wait(5000).unwrap(), "engine must cancel and join audio before completing shutdown");

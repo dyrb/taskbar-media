@@ -28,6 +28,13 @@ pub struct Point {
     pub y: i32,
 }
 #[repr(C)]
+pub struct MouseTrack {
+    pub size: u32,
+    pub flags: u32,
+    pub hwnd: Raw,
+    pub hover: u32,
+}
+#[repr(C)]
 pub struct Msg {
     pub hwnd: Raw,
     pub message: u32,
@@ -212,6 +219,12 @@ unsafe extern "system" {
     pub fn UnregisterSuspendResumeNotification(handle: Raw) -> i32;
     pub fn SetFocus(hwnd: Raw) -> Raw;
     pub fn IsChild(parent: Raw, child: Raw) -> i32;
+    pub fn TrackMouseEvent(track: *mut MouseTrack) -> i32;
+    pub fn SetCapture(hwnd: Raw) -> Raw;
+    pub fn ReleaseCapture() -> i32;
+    pub fn GetKeyState(key: i32) -> i16;
+    pub fn MapWindowPoints(from: Raw, to: Raw, points: *mut Point, count: u32) -> i32;
+    pub fn SetForegroundWindow(hwnd: Raw) -> i32;
 }
 pub type SubclassProc = unsafe extern "system" fn(Raw, u32, usize, isize, usize, usize) -> isize;
 #[link(name = "comctl32")]

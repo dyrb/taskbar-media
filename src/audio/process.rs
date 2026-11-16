@@ -1,7 +1,6 @@
 //! Process-tree loopback and conservative GSMTC source identity resolution.
 use super::*;
-use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 struct Handle(Raw);
 impl Drop for Handle {
@@ -90,7 +89,7 @@ pub(super) fn source(source: &str) -> Result<Process> {
 
 const COMPLETION: Guid = Guid::from_u128(0x41d949ab_9862_444a_80f6_c261334da5eb);
 const MARSHAL: Guid = Guid::from_u128(0x00000003_0000_0000_c000_000000000046);
-static ACTIVATING: AtomicBool = AtomicBool::new(false);
+static ACTIVATING: Mutex<Option<Weak<Activation>>> = Mutex::new(None);
 #[repr(C)]
 struct Params {
     kind: u32,
@@ -156,7 +155,7 @@ impl Drop for Handler {
         unsafe {
             release_raw(self.marshal);
         }
-        ACTIVATING.store(false, Ordering::Release);
+        self.state.done.set();
     }
 }
 static HANDLER: CompletionVtbl = CompletionVtbl { unknown: UnknownVtbl { query, add_ref: add, release }, complete };
@@ -213,6 +212,46 @@ unsafe extern "system" fn complete(this: Raw, operation: Raw) -> i32 {
     }
     0
 }
+fn wait_for_activation(done: &Event, stop: &Event, deadline: Instant) -> Result<()> {
+    let handles = [stop.raw(), done.raw()];
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let timeout = remaining.as_millis().saturating_add(1).min((INFINITE - 1) as u128) as u32;
+    // SAFETY: both events are retained for the cancellable, bounded wait.
+    match unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, timeout) } {
+        0 => Err(Error::new("process audio cancelled", E_ABORT)),
+        1 => Ok(()),
+        258 => Err(Error::new("player audio activation timed out", ERROR_TIMEOUT)),
+        _ => Err(Error::last("wait for player audio activation")),
+    }
+}
+fn reserve_activation(
+    pending: &Mutex<Option<Weak<Activation>>>,
+    state: &Arc<Activation>,
+    stop: &Event,
+    deadline: Instant,
+) -> Result<()> {
+    loop {
+        if stop.wait(0)? {
+            return Err(Error::new("process audio cancelled", E_ABORT));
+        }
+        if Instant::now() >= deadline {
+            return Err(Error::new("player audio activation timed out", ERROR_TIMEOUT));
+        }
+        let previous = {
+            let mut active = crate::runtime::lock(pending);
+            match active.as_ref().and_then(Weak::upgrade) {
+                Some(previous) if !previous.done.wait(0)? => previous,
+                _ => {
+                    *active = Some(Arc::downgrade(state));
+                    return Ok(());
+                }
+            }
+        };
+        // A cancelled request can still complete in Windows. Wait for its callback instead of
+        // rejecting the next playback transition or starting another outstanding activation.
+        wait_for_activation(&previous.done, stop, deadline)?;
+    }
+}
 pub(super) fn activate(pid: u32, stop: &Event) -> Result<Com> {
     if stop.wait(0)? {
         return Err(Error::new("process audio cancelled", E_ABORT));
@@ -225,9 +264,8 @@ pub(super) fn activate(pid: u32, stop: &Event) -> Result<Com> {
     };
     let state = Arc::new(Activation { _params: params, variant, done: Event::new()?, result: Mutex::new(None) });
     let activity = crate::platform::Activity::callback()?;
-    if ACTIVATING.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
-        return Err(Error::new("process audio activation is still pending", 0x800700aau32 as i32));
-    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    reserve_activation(&ACTIVATING, &state, stop, deadline)?;
     let raw = Box::into_raw(Box::new(Handler {
         vt: &HANDLER,
         refs: AtomicU32::new(1),
@@ -243,18 +281,15 @@ pub(super) fn activate(pid: u32, stop: &Event) -> Result<Com> {
         (*raw).marshal = marshaler as usize;
         let path: Vec<u16> = "VAD\\Process_Loopback".encode_utf16().chain(Some(0)).collect();
         let mut operation = null_mut();
-        check(
-            ActivateAudioInterfaceAsync(path.as_ptr(), &AUDIO_CLIENT, &state.variant, handler.raw(), &mut operation),
-            "activate player audio",
-        )?;
-        let _operation = Com::owned(operation, "player audio activation")?;
-        let handles = [stop.raw(), state.done.raw()];
-        match WaitForMultipleObjects(2, handles.as_ptr(), 0, 10_000) {
-            0 => return Err(Error::new("process audio cancelled", E_ABORT)),
-            1 => {}
-            258 => return Err(Error::new("player audio activation timed out", ERROR_TIMEOUT)),
-            _ => return Err(Error::last("wait for player audio activation")),
+        let hr =
+            ActivateAudioInterfaceAsync(path.as_ptr(), &AUDIO_CLIENT, &state.variant, handler.raw(), &mut operation);
+        if hr < 0 {
+            state.done.set();
+            release_raw(operation as usize);
+            return Err(Error::new("activate player audio", hr));
         }
+        let _operation = Com::owned(operation, "player audio activation")?;
+        wait_for_activation(&state.done, stop, deadline)?;
         let (hr, raw) =
             crate::runtime::lock(&state.result).take().ok_or(Error::new("missing audio activation result", E_FAIL))?;
         let result = Com::owned(raw as Raw, "player audio client");
@@ -290,6 +325,39 @@ unsafe extern "system" {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn activation() -> Arc<Activation> {
+        Arc::new(Activation {
+            _params: Box::new(Params { kind: 1, pid: 1, mode: 0 }),
+            variant: Variant { kind: 65, reserved: [0; 3], blob: Blob { len: 0, pointer: 0 } },
+            done: Event::new().unwrap(),
+            result: Mutex::new(None),
+        })
+    }
+    #[test]
+    fn next_activation_waits_for_late_completion_and_respects_cancellation() {
+        let old = activation();
+        let next = activation();
+        let pending = Mutex::new(Some(Arc::downgrade(&old)));
+        let stop = Event::new().unwrap();
+        stop.set();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        assert_eq!(reserve_activation(&pending, &next, &stop, deadline).unwrap_err().code, E_ABORT);
+        stop.reset();
+        assert_eq!(reserve_activation(&pending, &next, &stop, Instant::now()).unwrap_err().code, ERROR_TIMEOUT);
+        let ready = Event::new().unwrap();
+        std::thread::scope(|scope| {
+            let waiter = scope.spawn(|| {
+                ready.set();
+                reserve_activation(&pending, &next, &stop, deadline)
+            });
+            assert!(ready.wait(1000).unwrap());
+            old.done.set();
+            waiter.join().unwrap().unwrap();
+        });
+        assert!(Arc::ptr_eq(&crate::runtime::lock(&pending).as_ref().unwrap().upgrade().unwrap(), &next));
+        // Windows may retain the previous handler after completing the operation.
+        assert_eq!(Arc::strong_count(&old), 1);
+    }
     #[test]
     fn process_activation_abi_and_identity_are_bounded() {
         assert_eq!(size_of::<Entry>(), 568);

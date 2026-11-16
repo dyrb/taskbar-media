@@ -18,6 +18,16 @@ const CAPTURE_CLIENT: Guid = Guid::from_u128(0xc8adbd64_e71e_48a0_a4de_185c395cd
 const DEVICE_CHANGED: u32 = 1;
 const RETRY: u32 = 2;
 
+fn retry_delay(error: Error, attempt: usize) -> Option<Duration> {
+    if !matches!(
+        error.code as u32,
+        0x88890004 | 0x8889000f | 0x88890010 | 0x88890026 | 0x800700aa | 0x80070490 | 0x800706ba | 0x80010108
+    ) {
+        return None;
+    }
+    [250, 750, 2000].get(attempt).copied().map(Duration::from_millis)
+}
+
 #[repr(C)]
 struct EnumeratorVtbl {
     unknown: UnknownVtbl,
@@ -296,6 +306,7 @@ struct Capture {
     format: Format,
     buffer_frames: u32,
     id: String,
+    _process: Option<process::Process>,
 }
 
 impl Capture {
@@ -369,7 +380,7 @@ impl Capture {
             check((vt.service)(client.raw(), &CAPTURE_CLIENT, &mut raw), "audio capture service")?;
             let capture = Com::owned(raw, "audio capture service")?;
             check((vt.start)(client.raw()), "start audio capture")?;
-            Ok(Self { capture, client, event, format, buffer_frames, id })
+            Ok(Self { capture, client, event, format, buffer_frames, id, _process: None })
         }
     }
 
@@ -483,12 +494,6 @@ pub(crate) fn monitor_tuned(
         return Err(Error::new("frame rate must be between 1 and 60", E_INVALIDARG));
     }
     let _apartment = Apartment::mta()?;
-    let _process = match target {
-        Target::Player(source) => Some(process::source(source)?),
-        _ => None,
-    };
-    let selected_process = _process.as_ref().map(|p| Target::Process(p.pid));
-    let target = selected_process.as_ref().unwrap_or(target);
     let enumerator = enumerator()?;
     let wake = Wake::new()?;
     let _registration = Registration::new(&enumerator, &wake)?;
@@ -502,15 +507,20 @@ pub(crate) fn monitor_tuned(
     let mut last_frame = next_frame;
     let mut smoothing = Smoothing::new(Duration::from_millis(35), release)?;
     let mut dirty = false;
-    let mut retried = false;
+    let mut attempts = 0;
+    let mut retry_at = None;
     wake.signal(DEVICE_CHANGED);
     loop {
         let now = Instant::now();
         if deadline.is_some_and(|d| now >= d) {
             return Ok(());
         }
+        if retry_at.is_some_and(|d| now >= d) {
+            retry_at = None;
+            wake.signal(RETRY);
+        }
         let frame_due = dirty.then_some(next_frame);
-        let due = [deadline, frame_due].into_iter().flatten().min();
+        let due = [deadline, frame_due, retry_at].into_iter().flatten().min();
         let timeout = due.map_or(INFINITE, |d| {
             let wait = d.saturating_duration_since(now);
             wait.as_millis()
@@ -526,14 +536,25 @@ pub(crate) fn monitor_tuned(
             1 => {
                 let flags = wake.take();
                 if flags & DEVICE_CHANGED != 0 {
-                    retried = false;
+                    attempts = 0;
                 }
+                retry_at = None;
                 let replacement = match target {
                     Target::Process(pid) => {
                         if capture.is_some() {
                             continue;
                         }
                         Capture::open_process(*pid, stop)
+                    }
+                    Target::Player(source) => {
+                        if capture.is_some() {
+                            continue;
+                        }
+                        process::source(source).and_then(|process| {
+                            let mut capture = Capture::open_process(process.pid, stop)?;
+                            capture._process = Some(process);
+                            Ok(capture)
+                        })
                     }
                     _ => match target.resolve(&enumerator) {
                         Ok(device) => match device_id(&device) {
@@ -556,22 +577,32 @@ pub(crate) fn monitor_tuned(
                         last_frame = next_frame - interval;
                         smoothing = Smoothing::new(Duration::from_millis(35), release)?;
                     }
-                    Err(error) => update(Update::Unavailable(error))?,
+                    Err(error) => {
+                        if let Some(delay) = retry_delay(error, attempts) {
+                            retry_at = Some(Instant::now() + delay);
+                            attempts += 1;
+                        }
+                        update(Update::Unavailable(error))?;
+                    }
                 }
             }
             2 => {
                 if let (Some(c), Some(a)) = (&capture, &mut analyzer) {
                     match c.drain(a, stop) {
-                        Ok(received) => dirty |= received,
+                        Ok(received) => {
+                            dirty |= received;
+                            if received {
+                                attempts = 0;
+                            }
+                        }
                         Err(error) => {
                             capture = None;
                             analyzer = None;
                             dirty = false;
                             update(Update::Unavailable(error))?;
-                            // One immediate recovery; further attempts require a real device event.
-                            if !retried {
-                                retried = true;
-                                wake.signal(RETRY);
+                            if let Some(delay) = retry_delay(error, attempts) {
+                                retry_at = Some(Instant::now() + delay);
+                                attempts += 1;
                             }
                         }
                     }
@@ -622,5 +653,16 @@ mod tests {
         })
         .unwrap();
         assert!(!called);
+    }
+
+    #[test]
+    fn transient_audio_recovery_is_bounded_and_skips_permanent_errors() {
+        let invalidated = Error::new("device invalidated", 0x88890004u32 as i32);
+        assert_eq!(retry_delay(invalidated, 0), Some(Duration::from_millis(250)));
+        assert_eq!(retry_delay(invalidated, 2), Some(Duration::from_millis(2000)));
+        assert_eq!(retry_delay(invalidated, 3), None);
+        for code in [E_ABORT, E_INVALIDARG, E_BOUNDS, ERROR_TIMEOUT, 0x80070005u32 as i32] {
+            assert_eq!(retry_delay(Error::new("permanent or pending", code), 0), None);
+        }
     }
 }
