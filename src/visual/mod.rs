@@ -304,8 +304,8 @@ impl Analyzer {
         let mut result = Frame { frames: self.frames, discontinuities: self.discontinuities, ..Frame::default() };
         let mut sum = 0.0f64;
         for i in 0..WINDOW {
-            for channel in 0..self.format.channels {
-                let value = self.ring[channel][(self.next + i) & (WINDOW - 1)];
+            for channel in self.ring.iter().take(self.format.channels) {
+                let value = channel[(self.next + i) & (WINDOW - 1)];
                 let range = &mut result.wave[i * POINTS / WINDOW];
                 range.low = range.low.min(value);
                 range.high = range.high.max(value);

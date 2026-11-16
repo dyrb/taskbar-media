@@ -701,8 +701,8 @@ fn dispatch(hwnd: Raw, message: u32, w: usize, l: isize) -> isize {
                 view.hwnd = hwnd;
                 VIEWS.with(|v| v.borrow_mut().push(hwnd));
                 view.style();
-                for i in 0..4 {
-                    view.buttons[i] = CreateWindowExW(
+                for (i, button) in view.buttons.iter_mut().enumerate() {
+                    *button = CreateWindowExW(
                         0,
                         wide("BUTTON").as_ptr(),
                         wide("").as_ptr(),
@@ -716,7 +716,7 @@ fn dispatch(hwnd: Raw, message: u32, w: usize, l: isize) -> isize {
                         CLASS_MODULE.get().copied().unwrap_or(0) as Raw,
                         null_mut(),
                     );
-                    if view.buttons[i].is_null() || SetWindowSubclass(view.buttons[i], button_proc, 1, 0) == 0 {
+                    if button.is_null() || SetWindowSubclass(*button, button_proc, 1, 0) == 0 {
                         return -1;
                     }
                 }
